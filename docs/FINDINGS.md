@@ -3,8 +3,8 @@
 Everything here was learned by doing a real migration, and every item cost at least one run. They
 are written down because none of them is visible in the code, and most of them return success.
 
-Measured against **Team Coherence 7.1** (client files dated 2009). The repository was 4,237 file
-archives, 44,450 revisions, about 10 GB, spanning 1996–2019.
+Measured against **Team Coherence 7.1** (client files dated 2009). The repository was a few thousand file
+archives and tens of thousands of revisions, spanning more than two decades.
 
 ---
 
@@ -42,7 +42,7 @@ initialising dies on a nil object.
 
 `TCDVcsEnumLabels(RootID, RevID, LabelType, …)` documents `RootID` as "a Project, Folder, **or a
 File**". Per-revision labels only work when it is a **file** id. Pass a *project* id and it returns
-**nothing at all, silently, with `Err_OK`** — 44,446 calls produced an empty attachment file.
+**nothing at all, silently, with `Err_OK`** — tens of thousands of calls produced an empty attachment file.
 
 **An empty attachment list is a failure, not a repository without labels.** Assert it.
 
@@ -61,9 +61,9 @@ label pass without it.**
 
 The revision enumeration callback hands you `VerCount` — how many version labels that revision
 carries — and `PromoCount`. Keeping it means only revisions with `VerCount > 0` need to be asked
-*which* labels they carry: **8,039 calls instead of 44,450**, because only 18% of revisions carried
+*which* labels they carry: **a fifth of the calls**, because only 18% of revisions carried
 a label. It also makes a "does this file have any label" pre-scan pointless — that scan took 2.5
-hours across 4,237 files to answer a weaker question.
+hours across every file in the repository to answer a weaker question.
 
 Better still, it is an **independent cross-check**: TC states the total before anything asks what
 the labels are, so the two numbers must agree.
@@ -79,8 +79,8 @@ being empty after tens of thousands of calls.
 
 Measured against spawning `tc.exe` per revision: **0.21 s vs 2.6 s per revision**, because a bare
 `tc Whoami` — touching no archive at all — costs **~930 ms** of process start, DLL load, connect and
-authenticate. Across 44,450 revisions that is 11.5 hours spent on process startup. A full pull went
-from ~12 hours to ~100 minutes.
+authenticate. Multiplied by every revision that is hours spent purely on starting processes. A full pull went
+from roughly twelve hours to under two - about 8x end to end.
 
 It also produced **fewer wrong revisions** than the CLI path (42 against 83, a strict subset), and
 needs no workaround for paths containing spaces, because a path is a parameter rather than something
@@ -116,13 +116,13 @@ cannot ask for "the tree as of 3 March 2004", which is the one thing that would 
 
 Consequently **batching barely helps for history**. Counted against a real repository: the only
 files that can share a `Get` are those inside one check-in that happen to share a revision number,
-and TC increments each file's revision independently. 44,450 revisions collapse to 39,414 calls —
+and TC increments each file's revision independently. the revisions collapse to 89% as many calls —
 **1.1×** — with 81% of revisions sitting alone in their group.
 
 ### `tc.exe` cannot parse a path containing a space, even quoted
 
 It silently falls back to the current folder and reports "No files found under …". This affected 117
-files and 1,927 revisions (4.3%). Passing the path in a list file (`Get "@list.txt"`) bypasses the
+files and 4.3% of all revisions. Passing the path in a list file (`Get "@list.txt"`) bypasses the
 command-line parser and works. The DLL path has no such problem.
 
 ### Changing the view leaves the current folder stale
@@ -172,13 +172,13 @@ A check-in of 50 files increments each file's revision **independently**, so the
 to recover. Reconstruct one from contiguous revisions sharing an author and a comment.
 
 **Do not use a time window.** A genuine check-in can take hours to upload — one here spans 16 hours
-and 652 files — and a 180-second cap shattered 2,620 real check-ins into fragments.
+and 652 files — and a 180-second cap shattered thousands of real check-ins into fragments.
 
 ### But you must split when a file repeats
 
 A git tree holds **one** version of a path. If a group contains two revisions of the same file, only
 the last survives and the earlier revision disappears — fetched, written as a blob, then referenced
-by nothing. That hid **9,327 revisions across 2,349 files**, visible only as dangling blobs in
+by nothing. That hid **a fifth of the revisions, across hundreds of files**, visible only as dangling blobs in
 `git fsck`.
 
 Start a new commit as soon as a group would contain a second revision of a file already in it. No
@@ -212,7 +212,7 @@ plainly it is a tip correction rather than history.
 ## Verification, and why most of it is weak
 
 Two independent migrations of the same repository — one fetching content via `tc.exe`, one via the
-DLL — agreed on 25,852 commits, 38 tags, the same tip tree, the same 6 unfetchable revisions, and
+DLL — agreed on the commit count, the tag count, the same tip tree, the same 6 unfetchable revisions, and
 the same label totals. **They differed in 4,166 commit trees: 16% of the history.**
 
 One bad revision contaminates every later commit's tree until some revision replaces it, so a

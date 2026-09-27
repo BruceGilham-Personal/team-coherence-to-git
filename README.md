@@ -4,9 +4,9 @@ Migrates a [Team Coherence](https://www.teamcoherence.com/) repository into git:
 revision as a commit, every version label as a tag, with verification that the content it wrote is
 the content Team Coherence holds.
 
-Built against **Team Coherence 7.1** (QSC, files dated 2009) and used to migrate a real 23-year
-repository: **4,237 file archives, 44,450 revisions, ~10 GB, 1996–2019**, producing 25,852 commits
-and 38 tags.
+Built against **Team Coherence 7.1** (QSC, files dated 2009) and used to migrate a real repository
+spanning more than two decades — a few thousand file archives and tens of thousands of revisions —
+producing tens of thousands of commits and several dozen tags.
 
 ## Why this exists
 
@@ -61,7 +61,7 @@ Four numbers, produced by different calls than the ones that did the work:
 | Check | What it catches |
 |---|---|
 | revisions vs fetched + known-empty | a revision never fetched at all. A run once reported `failed 0` with 77 revisions never attempted |
-| `git fsck` dangling blobs | content fetched but referenced by no commit — 9,327 of them exposed a grouping bug that hid 9,327 revisions |
+| `git fsck` dangling blobs | content fetched but referenced by no commit — thousands of them exposed a grouping bug that hid a fifth of the revisions |
 | label attachments vs TC's own `ver_count` | a label pass that silently answered a per-file question instead of a per-revision one |
 | **archive size vs TC's recorded size** | **content that arrived but is wrong.** Two migrations of the same repository differed in 16% of commit trees; this is the check that said which was right |
 

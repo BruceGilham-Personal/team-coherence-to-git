@@ -67,7 +67,7 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 
 Exit codes: `0` success, `1` stopped, `2` no session, `3` no such project id, `4` failed.
 
-**Start with `--limit`.** A run over the whole repository is 44,446 revisions and one `tc Get`
+**Start with `--limit`.** A run over the whole repository is tens of thousands of revisions and one `tc Get`
 each; a 25-file run exercises every phase in a couple of minutes and tells you whether the
 settings, the view and the git output are right before you commit hours to it.
 
@@ -86,7 +86,7 @@ one folder of 241 files totalling 93 MB:
 **6.7x faster on IPsec.** Round-trip latency was unchanged (64 ms vs 69 ms) and per-call
 overhead was unchanged, so this is not latency - it is throughput lost to the SSL tunnel.
 
-The whole migration moves **~10 GB** (44,446 revisions, mean 235 KB each), so this single
+The whole migration moves several gigabytes (mean revision about 235 KB), so this single
 setting is worth more than every other optimisation combined. **Check you are on IPsec before
 starting a full run.**
 
@@ -112,7 +112,7 @@ phase is bound by whichever is larger. Both are addressed by running several fet
    concentrated in a few files.
 4. **Use "Test run: first N files" before any full run.**
 
-### Rough totals for a full migration (44,446 revisions, ~10 GB)
+### Rough totals for a full migration (tens of thousands of revisions, several GB)
 
 | Setup | Fetch phase |
 |---|---|
@@ -183,10 +183,10 @@ date selector - so the only thing that can be batched is the set of files inside
 happen to share the same revision number. Counted against this repository's own metadata:
 
 ```
-revisions                44450
-check-ins                17287
-batchable groups         38268
-Get calls if batched      39414   ->  1.1x
+revisions                       100%
+check-ins reconstructed          39%
+batchable groups                 86%
+Get calls if batched             89%   ->  1.1x
 ```
 
 **81.2%** of revisions sit alone in their group, mean 1.16 files per group, because Team Coherence
@@ -212,7 +212,7 @@ recorded because none of them is visible in the code, and each cost a run to fin
 
 ### A finished run's failure count proves nothing
 
-The 2026-09-26 full run reported `failed 0` and `All 44450 check-ins migrated`. **77 revisions had
+One full run reported `failed 0` and `All check-ins migrated`. **77 revisions had
 never been fetched at all** - not fetched, not recorded as empty, not recorded as failed. It
 resumed from check-in 35,307 and never revisited what lay behind its own checkpoint, and the
 earlier sessions' attempts left no trace because `failed.csv` was never written.
@@ -247,11 +247,11 @@ GIT_ALTERNATE_OBJECT_DIRECTORIES=old.git/objects \
 
 Revisions are grouped into check-ins by **author + comment**, over contiguous revisions in date
 order, with no time limit. That is right for telling one check-in from another, and a 180-second
-cap was wrong - it shattered 2,620 real check-ins into fragments.
+cap was wrong - it shattered thousands of real check-ins into fragments.
 
 But it is not sufficient on its own. A git tree holds **one** version of a path, so if a group
 contains two revisions of the *same file*, only the last one survives and the earlier revision
-disappears from history. On the 2026-09-26 full run that hid **9,327 revisions** across 2,349
+disappears from history. On one full run that hid **a fifth of the revisions** across hundreds of
 files - visible only as dangling blobs in `git fsck`, because the content was fetched and written
 but never referenced by a commit.
 
@@ -336,8 +336,8 @@ splits in two, and the split is what matters:
 | server-side delta-chain reconstruction and transfer | ~1,670 | unavoidable here |
 
 The 930 ms was measured with `tc Whoami`, which touches no archive at all (912/946/934 ms). It is
-paid on **every** revision because the fetcher spawns the CLI per revision - **11.5 hours** across
-44,450 revisions, spent entirely on starting processes.
+paid on **every** revision because the fetcher spawns the CLI per revision - hours of pure
+startup across a full migration, spent on nothing but creating processes.
 
 The rest is TC reconstructing each revision by walking its delta chain from the beginning, which
 is why a file at revision 1.165 costs many times what the same file at 1.1 does. Late in a run, when only
