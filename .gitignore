@@ -1,0 +1,28 @@
+# Delphi build output
+*.exe
+*.dcu
+*.obj
+*.res
+*.local
+*.identcache
+*.dproj.local
+*.~*
+__history/
+__recovery/
+Win32/
+Win64/
+
+# Anything a run produces. These hold repository content and server details:
+# never commit a work folder.
+*.log
+blobs/
+meta/
+*.git/
+state.txt
+TCMigrator.ini
+
+# Credentials must never be written to disk by these tools, but in case a local
+# helper script is added alongside them:
+*.pwd
+secrets*
+*.local.ps1
