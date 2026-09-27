@@ -81,8 +81,7 @@ Used successfully for one large migration. Not widely tested — expect to read 
 
 ## Licence
 
-**No licence has been chosen yet** — add one before publishing. Until a `LICENSE` file exists, all
-rights are reserved by default and others cannot safely reuse this.
+[MIT](LICENSE). Use it, change it, ship it, sell it — just keep the copyright notice.
 
 ## Contributing
 
