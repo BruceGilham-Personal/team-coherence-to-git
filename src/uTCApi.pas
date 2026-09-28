@@ -236,12 +236,22 @@ begin
   if P = nil then Result := '' else Result := string(AnsiString(P));
 end;
 
-function UnixToDT(TS: Integer): TDateTime;
+function TCDateToDT(TS: Integer): TDateTime;
 begin
-  // True = keep it in UTC. With False these are LOCAL times, which round-trip back to the
-  // right instant for git but are written to the CSVs with a "Z" that lies about them.
-  // If this changes, DateTimeToUnix in uPipeline must change with it or every commit shifts.
-  if TS <= 0 then Result := 0 else Result := UnixToDateTime(Int64(TS), True);
+  // TC's integer dates are NOT Unix seconds. They are packed DOS/FAT date-times (the
+  // FileAge / DateTimeToFileDate format): year-1980, month, day, hour, minute, second/2 in
+  // bit fields, holding the wall-clock time the TC client shows. Read as Unix seconds they
+  // decode to a smooth but wrong date - 2026-04-27 07:42:20 came out as 2019-03-27 09:07:22 -
+  // which passed for plausible history. Verified to the second against a TC History Report.
+  // The wall-clock time is taken as this PC's time zone and stored as UTC, so the CSVs' "Z"
+  // is true and uPipeline's DateTimeToUnix(..., True) needs no change.
+  Result := 0;
+  if TS <= 0 then Exit;
+  try
+    Result := TTimeZone.Local.ToUniversalTime(FileDateToDateTime(TS));
+  except
+    on EConvertError do Result := 0;   // bit fields that do not form a real date
+  end;
 end;
 
 // ---------------------------------------------------------------- callbacks
@@ -309,7 +319,7 @@ begin
   R.Revision := S(pName);
   R.Author := S(pAuthor);
   R.Comment := S(pComments);
-  R.When := UnixToDT(Timestamp);
+  R.When := TCDateToDT(Timestamp);
   R.Size := OriginalSize;
   R.VerCount := VerCount;   // free here; saves tens of thousands of calls in the label pass
   GSession.Revisions.Add(R);
@@ -325,7 +335,7 @@ begin
   for I := 0 to GSession.Labels.Count - 1 do
     if GSession.Labels[I].ID = ID then Exit(True);      // labels repeat across roots
   L.ID := ID; L.Name := S(pName); L.Comment := S(pComments);
-  L.When := UnixToDT(Timestamp); L.LabelType := LabelType;
+  L.When := TCDateToDT(Timestamp); L.LabelType := LabelType;
   GSession.Labels.Add(L);
   Result := True;
 end;

@@ -7,6 +7,7 @@
     TCDump.exe -connect -user <u> [-pwd <p>]          test a session only
     TCDump.exe -raw     -user <u> [-pwd <p>]          show the first rows of each enumerator
     TCDump.exe -extract -out <dir> -user <u> [-pwd <p>]   write the metadata CSVs
+    TCDump.exe -revs    -user <u> [-pwd <p>] -file <id>   both date fields of one file's revisions
 
   All signatures below are the documented ones from TCVcsApi.chm (shipped in the TC client
   Bin folder; extract it with:  hh.exe -decompile <outdir> TCVcsApi.chm  - copy it out of
@@ -129,6 +130,7 @@ var
   ModeDialog: Boolean = False;
   ModeConns: Boolean = False;
   ModeGet: Boolean = False;
+  ModeRevs: Boolean = False;   // -revs -file <id>: dump both date fields for one file
   GetList: string = '';      // a file of "file_id,revision" lines
   GetFileID: Cardinal = 0;
   GetRev: string = '';
@@ -185,10 +187,17 @@ begin
     Result := S;
 end;
 
-function UnixToIso(TS: Integer): string;
+function TCDateToIso(TS: Integer): string;
 begin
+  // TC dates are packed DOS/FAT date-times in wall-clock time, not Unix seconds - see
+  // TCDateToDT in src\uTCApi.pas. Stored as UTC, the same as TCMigrator.
   if TS <= 0 then Exit('');
-  Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', UnixToDateTime(Int64(TS), False));
+  try
+    Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+      TTimeZone.Local.ToUniversalTime(FileDateToDateTime(TS)));
+  except
+    on EConvertError do Result := '';
+  end;
 end;
 
 function Api(const Name: string): Pointer;
@@ -288,9 +297,10 @@ function CbFiles(Context, Data: Pointer; pName, pLocalPath, pLockedBy: PTCChar;
   Modified, Timestamp, CompressedSize, RevisionCount, ShareCount, Status: Integer;
   IsVirtual, Frozen: Boolean): Boolean; stdcall;
 begin
-  if ModeRaw then
-    Say(Format('  file id=%d parent=%d name="%s" revs=%d shares=%d local="%s"',
-      [ID, ParentID, string(pName), RevisionCount, ShareCount, string(pLocalPath)]));
+  if ModeRaw or ModeRevs then
+    Say(Format('  file id=%d name="%s" revs=%d  Modified=%d -> %s   Timestamp=%d -> %s',
+      [ID, string(pName), RevisionCount,
+       Modified, TCDateToIso(Modified), Timestamp, TCDateToIso(Timestamp)]));
   FilesCsv.Add(Format('%d,%s,%s,,%d,%d,%s,%s',
     [ID, CsvQ(string(pName)), CsvQ(string(pLocalPath)), RevisionCount, ShareCount,
      BoolToStr(IsVirtual, True), BoolToStr(Frozen, True)]));
@@ -302,14 +312,24 @@ function CbRevisions(Context, Data: Pointer; pName, pAuthor, pComments, pLockedB
   ID, ParentID: Cardinal;
   Modified, Timestamp, CompressedSize, OriginalSize, CRC, VerCount, PromoCount: Integer): Boolean; stdcall;
 begin
+  // Diagnostic: the callback hands back TWO integer dates, Modified and Timestamp, and the
+  // documentation does not say which is the check-in time. Print both, raw and converted, so
+  // the question is settled by comparison with TC's own History Report rather than by guessing.
+  if ModeRevs then
+  begin
+    Say(Format('  %-16s %-10s Modified=%11d -> %s   Timestamp=%11d -> %s',
+      [string(pName), string(pAuthor),
+       Modified, TCDateToIso(Modified), Timestamp, TCDateToIso(Timestamp)]));
+    Exit(True);
+  end;
   if ModeRaw then
     Say(Format('  rev "%s" author="%s" ts=%s size=%d id=%d parent=%d comment="%s"',
-      [string(pName), string(pAuthor), UnixToIso(Timestamp), OriginalSize, ID, ParentID,
+      [string(pName), string(pAuthor), TCDateToIso(Timestamp), OriginalSize, ID, ParentID,
        Copy(string(pComments), 1, 50)]));
   // file_id,tc_path,revision,author,timestamp_utc,comment_b64,action,size
   RevIds.Add(Format('%d=%d|%s', [ID, CurrentFileID, string(pName)]));
   RevsCsv.Add(Format('%d,,%s,%s,%s,%s,modify,%d',
-    [CurrentFileID, CsvQ(string(pName)), CsvQ(string(pAuthor)), UnixToIso(Timestamp),
+    [CurrentFileID, CsvQ(string(pName)), CsvQ(string(pAuthor)), TCDateToIso(Timestamp),
      B64(string(pComments)), OriginalSize]));
   Result := RawOk;
 end;
@@ -329,9 +349,9 @@ function CbLabels(Context, Data: Pointer; LabelType: Integer; pName, pComments: 
 begin
   if ModeRaw then
     Say(Format('  label id=%d type=%d name="%s" ts=%s comment="%s"',
-      [ID, LabelType, string(pName), UnixToIso(Timestamp), Copy(string(pComments), 1, 40)]));
+      [ID, LabelType, string(pName), TCDateToIso(Timestamp), Copy(string(pComments), 1, 40)]));
   LabelsCsv.Add(Format('%d,%s,%s,,%s,,%d',
-    [ID, CsvQ(string(pName)), B64(string(pComments)), UnixToIso(Timestamp), LabelType]));
+    [ID, CsvQ(string(pName)), B64(string(pComments)), TCDateToIso(Timestamp), LabelType]));
   Result := RawOk;
 end;
 
@@ -676,11 +696,16 @@ begin
   Say('        Fetch revisions through the DLL instead of tc.exe and print the SHA-256 of');
   Say('        everything that arrives, for comparison with meta\blobs.csv. Read-only: the');
   Say('        checkout is made with Lock=False, which QSC''s help calls a Get.');
+  Say('');
+  Say('  TCDump.exe -revs -user <u> [-pwd <p>] -file <id>');
+  Say('        Print both date fields of every revision of one file, raw and decoded, to');
+  Say('        check them against a TC History Report.');
 end;
 
 var
   I: Integer;
   A: string;
+  RevsFn: TFnEnumRevisions;
 begin
   try
     BinDir := 'C:\Program Files (x86)\Qsc\Team Coherence\Client\Bin';
@@ -701,6 +726,7 @@ begin
       else if (A = '-pwd')  and (I < ParamCount) then begin Inc(I); Password := ParamStr(I); end
       else if (A = '-root') and (I < ParamCount) then begin Inc(I); RootID := StrToUIntDef(ParamStr(I), 0); end
       else if A = '-getrev' then ModeGet := True
+      else if A = '-revs' then ModeRevs := True
       else if (A = '-list') and (I < ParamCount) then begin Inc(I); GetList := ParamStr(I); end
       else if (A = '-file') and (I < ParamCount) then begin Inc(I); GetFileID := StrToUIntDef(ParamStr(I), 0); end
       else if (A = '-rev')  and (I < ParamCount) then begin Inc(I); GetRev := ParamStr(I); end
@@ -708,7 +734,7 @@ begin
       Inc(I);
     end;
 
-    if not (ModeProbe or ModeRaw or ModeExtract or ModeConnect or ModeConns or ModeGet) then begin Usage; Halt(2); end;
+    if not (ModeProbe or ModeRaw or ModeExtract or ModeConnect or ModeConns or ModeGet or ModeRevs) then begin Usage; Halt(2); end;
     if ModeExtract and (OutDir = '') then begin Say('-extract needs -out <dir>'); Halt(2); end;
     if ModeGet then
     begin
@@ -750,6 +776,17 @@ begin
 
       // before EnumerateAll: fetching needs the session, not the metadata, and enumerating
       // everything first would cost the best part of an hour for nothing
+      if ModeRevs then
+      begin
+        if GetFileID = 0 then begin Say('-revs needs -file <id>'); Halt(2); end;
+        RevsFn := Api('TCDVcsEnumRevisions');
+        if not Assigned(RevsFn) then begin Say('TCDVcsEnumRevisions not exported'); Halt(3); end;
+        CurrentFileID := GetFileID;
+        Say(Format('Revisions for file_id %d - both date fields, raw and converted:', [GetFileID]));
+        RevsFn(GetFileID, nil, nil, CbRevisions);
+        Disconnect;
+        Halt(0);
+      end;
       if ModeGet then
       begin
         ForceDirectories(OutDir);

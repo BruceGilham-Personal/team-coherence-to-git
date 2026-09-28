@@ -57,6 +57,30 @@ That ran for five hours before anyone looked at the shape of the data: 36 attach
 is not a dense region, it is the signature of the bug. **Persist `rev_id`, and refuse to run the
 label pass without it.**
 
+### The integer dates are DOS date-times, not Unix time
+
+The revision and label callbacks hand back dates as a plain `Integer`, and the documentation does
+not say what it counts. The obvious guess, Unix seconds, is **wrong, and produces believable
+dates.** The value is a packed DOS/FAT date-time, the format of Delphi's `FileAge` and
+`DateTimeToFileDate`: year-1980, month, day, hour, minute and second/2 in bit fields. It holds the
+wall-clock time the TC client displays, with no time zone. Decode it with `FileDateToDateTime`.
+
+Read as Unix seconds, those bit fields give dates that still increase smoothly, so nothing looks
+broken. A check-in made on 2026-04-27 07:42:20 came out as 2019-03-27 09:07:22. The whole
+history shifted back by seven or eight years, by a different amount at each point, and a
+repository that is still in use looked as if its last check-in was years ago. The gap is not a
+constant offset, which rules out an epoch or time-zone mistake.
+
+It was caught only by setting one file's migrated dates against TC's own History Report. Once
+decoded as DOS date-times, every revision matched to the second. **Check the dates against a
+History Report before trusting them.** `TCDump -revs -file <id>` prints both date fields for
+exactly that comparison. The callback also returns a second field, `Modified`; for revisions the
+two fields agreed.
+
+Because the value carries no zone, the migrator reads it as the local time of the PC running the
+migration. If the TC server's clock was set to a different zone, every commit is off by that many
+hours.
+
 ### `VerCount` is free, and it makes the label pass affordable
 
 The revision enumeration callback hands you `VerCount` — how many version labels that revision
