@@ -170,6 +170,12 @@ type
     function ErrName(Code: Integer): string;
   end;
 
+// The zone TC's wall-clock dates are in: a Windows time zone key such as
+// 'Eastern Standard Time', or '' for this PC's zone. False if the key does not exist.
+function SetTCTimeZone(const KeyName: string): Boolean;
+function TCTimeZoneName: string;
+function TCWallToUtc(const Wall: TDateTime): TDateTime;
+
 implementation
 
 uses
@@ -236,6 +242,53 @@ begin
   if P = nil then Result := '' else Result := string(AnsiString(P));
 end;
 
+// ---------------------------------------------------------------- TC time zone
+// TC stores wall-clock time with no zone, so the zone has to be supplied. It is the zone the
+// TC server's clock ran in, which need not be the zone of the PC running the migration: one
+// migration run from a Pacific PC against an Eastern server put every commit 3 hours late.
+// Empty means "this PC's zone". Otherwise a Windows time zone key such as
+// 'Eastern Standard Time'; GetTimeZoneInformationForYear applies the rules in force in each
+// year, so dates before the 2007 US daylight-saving change convert correctly.
+
+var
+  GTCZoneKey: string = '';
+  GTCZoneDTZI: TDynamicTimeZoneInformation;
+  GTCZoneTZI: TTimeZoneInformation;
+  GTCZoneYear: Integer = 0;
+
+function SetTCTimeZone(const KeyName: string): Boolean;
+begin
+  GTCZoneKey := '';
+  GTCZoneYear := 0;
+  if KeyName = '' then Exit(True);
+  FillChar(GTCZoneDTZI, SizeOf(GTCZoneDTZI), 0);
+  StrPLCopy(PWideChar(@GTCZoneDTZI.TimeZoneKeyName[0]), KeyName, High(GTCZoneDTZI.TimeZoneKeyName));
+  Result := GetTimeZoneInformationForYear(2020, @GTCZoneDTZI, GTCZoneTZI);   // also proves the key exists
+  if Result then GTCZoneKey := KeyName;
+end;
+
+function TCTimeZoneName: string;
+begin
+  if GTCZoneKey = '' then Result := TTimeZone.Local.ID + ' (this PC)' else Result := GTCZoneKey;
+end;
+
+function TCWallToUtc(const Wall: TDateTime): TDateTime;
+var
+  Y: Integer;
+  L, U: TSystemTime;
+begin
+  if GTCZoneKey = '' then Exit(TTimeZone.Local.ToUniversalTime(Wall));
+  Y := YearOf(Wall);
+  if Y <> GTCZoneYear then
+  begin
+    if not GetTimeZoneInformationForYear(Y, @GTCZoneDTZI, GTCZoneTZI) then RaiseLastOSError;
+    GTCZoneYear := Y;
+  end;
+  DateTimeToSystemTime(Wall, L);
+  if not TzSpecificLocalTimeToSystemTime(@GTCZoneTZI, L, U) then RaiseLastOSError;
+  Result := SystemTimeToDateTime(U);
+end;
+
 function TCDateToDT(TS: Integer): TDateTime;
 begin
   // TC's integer dates are NOT Unix seconds. They are packed DOS/FAT date-times (the
@@ -243,12 +296,12 @@ begin
   // bit fields, holding the wall-clock time the TC client shows. Read as Unix seconds they
   // decode to a smooth but wrong date - 2026-04-27 07:42:20 came out as 2019-03-27 09:07:22 -
   // which passed for plausible history. Verified to the second against a TC History Report.
-  // The wall-clock time is taken as this PC's time zone and stored as UTC, so the CSVs' "Z"
-  // is true and uPipeline's DateTimeToUnix(..., True) needs no change.
+  // The wall-clock time is converted to UTC in the TC server's zone (SetTCTimeZone), so the
+  // CSVs' "Z" is true and uPipeline's DateTimeToUnix(..., True) needs no change.
   Result := 0;
   if TS <= 0 then Exit;
   try
-    Result := TTimeZone.Local.ToUniversalTime(FileDateToDateTime(TS));
+    Result := TCWallToUtc(FileDateToDateTime(TS));
   except
     on EConvertError do Result := 0;   // bit fields that do not form a real date
   end;

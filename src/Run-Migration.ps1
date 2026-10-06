@@ -48,6 +48,9 @@ param(
   # revisions - 42 against 83, its bad set a strict subset of the CLI's. -NoDll reverts to
   # spawning tc.exe per revision, which is slower and demonstrably less accurate.
   [switch] $NoDll,
+  # Windows time zone of the TC server's clock, e.g. 'Eastern Standard Time'. TC stores wall-clock
+  # time with no zone; empty means this PC's zone, which is wrong whenever the two differ.
+  [string] $TimeZone = '',
   [int]    $MaxAttempts = 400,
   [int]    $RetrySeconds = 60
 )
@@ -68,7 +71,7 @@ function Say([string] $msg) {
   Add-Content -LiteralPath $supervisorLog -Value $line
 }
 
-Say "supervisor starting: work=$Work threads=$Threads conn=$Conn repo=$Repo tags=$($Tags.IsPresent) dll=$(-not $NoDll.IsPresent)"
+Say "supervisor starting: work=$Work threads=$Threads conn=$Conn repo=$Repo tz=$TimeZone tags=$($Tags.IsPresent) dll=$(-not $NoDll.IsPresent)"
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   $log = Join-Path $Work ("migrate-{0:d3}.log" -f $attempt)
@@ -78,6 +81,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     '--branch', $Branch, '--window', "$Window", '--log', $log, '--repo', $Repo
   )
   if ($Conn) { $a += @('--conn', $Conn) }
+  if ($TimeZone) { $a += @('--tz', "`"$TimeZone`"") }
   if ($Tags) { $a += '--tags' } else { $a += '--no-tags' }
   if ($NoDll) { $a += '--no-dll' } else { $a += '--dll' }
 

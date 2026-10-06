@@ -77,9 +77,12 @@ History Report before trusting them.** `TCDump -revs -file <id>` prints both dat
 exactly that comparison. The callback also returns a second field, `Modified`; for revisions the
 two fields agreed.
 
-Because the value carries no zone, the migrator reads it as the local time of the PC running the
-migration. If the TC server's clock was set to a different zone, every commit is off by that many
-hours.
+The value also carries **no time zone**. It is the TC server's wall clock, so the zone has to be
+supplied, and it is the server's zone that matters, not that of the PC running the migration. A
+migration run from a Pacific PC against an Eastern server put every commit exactly three hours
+late, and nothing looked wrong until the times were compared with a History Report. Pass
+`--tz "<Windows time zone>"` (TCDump: `-tz`). The conversion uses each year's own daylight-saving
+rules, so dates from before the 2007 US change come out right too.
 
 ### `VerCount` is free, and it makes the label pass affordable
 

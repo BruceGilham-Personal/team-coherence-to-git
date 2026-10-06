@@ -8,6 +8,7 @@
     TCDump.exe -raw     -user <u> [-pwd <p>]          show the first rows of each enumerator
     TCDump.exe -extract -out <dir> -user <u> [-pwd <p>]   write the metadata CSVs
     TCDump.exe -revs    -user <u> [-pwd <p>] -file <id>   both date fields of one file's revisions
+    Add -tz "<Windows time zone>" when the TC server's clock is not in this PC's zone.
 
   All signatures below are the documented ones from TCVcsApi.chm (shipped in the TC client
   Bin folder; extract it with:  hh.exe -decompile <outdir> TCVcsApi.chm  - copy it out of
@@ -187,14 +188,37 @@ begin
     Result := S;
 end;
 
+var
+  // -tz: Windows time zone of the TC server's clock; '' = this PC's. Same as TCMigrator --tz.
+  TzKey: string = '';
+  TzDTZI: TDynamicTimeZoneInformation;
+  TzTZI: TTimeZoneInformation;
+  TzYear: Integer = 0;
+
+function WallToUtc(const Wall: TDateTime): TDateTime;
+var
+  L, U: TSystemTime;
+begin
+  if TzKey = '' then Exit(TTimeZone.Local.ToUniversalTime(Wall));
+  if YearOf(Wall) <> TzYear then
+  begin
+    FillChar(TzDTZI, SizeOf(TzDTZI), 0);
+    StrPLCopy(PWideChar(@TzDTZI.TimeZoneKeyName[0]), TzKey, High(TzDTZI.TimeZoneKeyName));
+    if not GetTimeZoneInformationForYear(YearOf(Wall), @TzDTZI, TzTZI) then RaiseLastOSError;
+    TzYear := YearOf(Wall);
+  end;
+  DateTimeToSystemTime(Wall, L);
+  if not TzSpecificLocalTimeToSystemTime(@TzTZI, L, U) then RaiseLastOSError;
+  Result := SystemTimeToDateTime(U);
+end;
+
 function TCDateToIso(TS: Integer): string;
 begin
   // TC dates are packed DOS/FAT date-times in wall-clock time, not Unix seconds - see
   // TCDateToDT in src\uTCApi.pas. Stored as UTC, the same as TCMigrator.
   if TS <= 0 then Exit('');
   try
-    Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      TTimeZone.Local.ToUniversalTime(FileDateToDateTime(TS)));
+    Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', WallToUtc(FileDateToDateTime(TS)));
   except
     on EConvertError do Result := '';
   end;
@@ -700,6 +724,9 @@ begin
   Say('  TCDump.exe -revs -user <u> [-pwd <p>] -file <id>');
   Say('        Print both date fields of every revision of one file, raw and decoded, to');
   Say('        check them against a TC History Report.');
+  Say('');
+  Say('  -tz "<Windows time zone>"   zone of the TC server''s clock, e.g. "Eastern Standard Time".');
+  Say('        Dates are written as UTC. Default: this PC''s zone.');
 end;
 
 var
@@ -730,6 +757,7 @@ begin
       else if (A = '-list') and (I < ParamCount) then begin Inc(I); GetList := ParamStr(I); end
       else if (A = '-file') and (I < ParamCount) then begin Inc(I); GetFileID := StrToUIntDef(ParamStr(I), 0); end
       else if (A = '-rev')  and (I < ParamCount) then begin Inc(I); GetRev := ParamStr(I); end
+      else if (A = '-tz')   and (I < ParamCount) then begin Inc(I); TzKey := ParamStr(I); end
       else begin Usage; Halt(2); end;
       Inc(I);
     end;

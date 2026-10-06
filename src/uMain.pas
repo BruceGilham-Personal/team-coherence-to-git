@@ -45,6 +45,7 @@ type
     FLayoutCheck: Boolean;
     FAutoProjects: string;
     FTcUser, FTcPwd, FTcConn: string;   // optional non-interactive login; never persisted
+    FTcZone: string;   // --tz: Windows time zone of the TC server's clock; '' = this PC's
     FAutoLog: string;
     FLogWriter: TStreamWriter;   // opened once; TFile.AppendAllText needs the file to exist
     FLogStream: TFileStream;     // opened shared so the log can be read while it is running
@@ -256,6 +257,7 @@ begin
     else if A = '--user'     then begin FTcUser := Next(I); Inc(I); end
     else if A = '--pwd'      then begin FTcPwd := Next(I); Inc(I); end
     else if A = '--conn'     then begin FTcConn := Next(I); Inc(I); end
+    else if A = '--tz'       then begin FTcZone := Next(I); Inc(I); end
     else if A = '--font'     then Inc(I);   // consumed in BuildUi
     ;
     Inc(I);
@@ -978,6 +980,18 @@ begin
     if not FAuto then MessageDlg('Tick at least one project to migrate.', mtInformation, [mbOK], 0);
     Exit;
   end;
+
+  // Every commit date depends on this, so an unknown zone stops the run rather than falling
+  // back to this PC's zone - which is exactly the mistake that put a whole history 3 hours out.
+  if not SetTCTimeZone(FTcZone) then
+  begin
+    DoLog(Format('Unknown time zone "%s". Use a Windows key, e.g. "Eastern Standard Time" ' +
+      '(PowerShell: Get-TimeZone -ListAvailable).', [FTcZone]));
+    if FAuto then FinishAuto(3)
+    else MessageDlg(Format('Unknown time zone "%s".', [FTcZone]), mtError, [mbOK], 0);
+    Exit;
+  end;
+  DoLog('Team Coherence dates are read as wall-clock time in: ' + TCTimeZoneName);
 
   if not FAuto then
     if MessageDlg(
