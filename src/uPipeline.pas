@@ -19,7 +19,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.SyncObjs,
-  Winapi.Windows, uTCApi;
+  System.RegularExpressions, Winapi.Windows, uTCApi;
 
 type
   TBlob = record
@@ -52,6 +52,14 @@ type
     // The migration's checkpoint file; '' = state.txt in WorkDir. A first update reads it to
     // learn what the migration put in git.
     StateFile: string;
+    // A content filter every blob passes through before it is written to git, for a history
+    // whose published copy was redacted: '' = none. A script or program, run with one
+    // argument - a list file of "<input>TAB<output>" lines - that writes each output. A .pl
+    // script is run with Git for Windows' perl. See tools\filters.
+    Filter: string;
+    // Paths never written to git, as ';'-separated masks matched against the file name, e.g.
+    // '*.pfx' for a history that had its certificates removed.
+    Exclude: string;
   end;
 
   // A state that needs a person to look at it, not a retry: the supervisor stops on it.
@@ -108,12 +116,24 @@ type
     FOldFiles: TArray<TTCFile>;                // metadata as the previous run saved it
     FOldRevs: TArray<TTCRevision>;
     FOldAttach: TArray<TTCAttachment>;
+    FOldLabels: TArray<TTCLabel>;
+    // ---- what is written for a blob: filtered, excluded, or an LFS pointer ---------------
+    FFiltered: TDictionary<string, string>;    // sha256 -> the filtered copy of that blob
+    FExcludes: TArray<string>;
+    FLfsPatterns: TArray<TRegEx>;              // from .gitattributes: paths stored in LFS
+    FAttrBlob: string;                         // git id of the tip's .gitattributes, if any
+    function Excluded(const Path: string): Boolean;
+    function IsLfsPath(const Path: string): Boolean;
+    procedure LoadLfsPatterns(const Commit: string);
+    procedure PrepareFiltered(const Shas: TArray<string>);
+    function ContentFile(const Sha: string): string;
+    function LfsPointer(const Sha: string; Store: Boolean): string;
+    function GitFileIds(const Files: TArray<string>): TDictionary<string, string>;
     function GitOut(const Args: string; out Output: string; TimeoutSec: Integer = 300): Integer;
     function RefSha(const Ref: string): string;
     function IsAncestor(const A, B: string): Boolean;
     function RemoteExists: Boolean;
     function TipPaths(const Rev: string = ''): TDictionary<string, string>;
-    function GitBlobIds(const Shas: TArray<string>): TDictionary<string, string>;
     function UpdateStatePath: string;
     procedure SortChronologically(var Revs: TArray<TTCRevision>);
     function SameCheckIn(const A, B: TTCRevision): Boolean;
@@ -129,8 +149,8 @@ type
     procedure RewindToCheckpointTip;
     procedure DiscardUncheckpointedBranch;
     function BlobIndex: TObjectDictionary<string, TList<Integer>>;
-    function EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
-      var Mark: Integer): Boolean;
+    function EmitBlob(FS: TStream; const B: TBlob; const Path: string;
+      Marks: TDictionary<string, Integer>; var Mark: Integer; out BlobMark: Integer): Boolean;
     procedure FetchRange(StartIdx, EndIdx: Integer);
     function ClaimNext: Integer;
     function PendingCount: Integer;
@@ -194,7 +214,7 @@ implementation
 
 uses
   System.Hash, System.IOUtils, System.DateUtils, System.StrUtils,
-  System.Generics.Defaults;
+  System.Generics.Defaults, System.Masks;
 
 constructor TPipeline.Create(ASession: TTCSession; const AOpt: TPipelineOptions);
 begin
@@ -214,10 +234,13 @@ begin
   FLedger := TDictionary<string, Boolean>.Create;
   FLedgerNew := TStringList.Create;
   FTree := TDictionary<string, TTreeEntry>.Create;
+  FFiltered := TDictionary<string, string>.Create;
+  FExcludes := FOpt.Exclude.Split([';'], TStringSplitOptions.ExcludeEmpty);
 end;
 
 destructor TPipeline.Destroy;
 begin
+  FFiltered.Free;
   FLedger.Free;
   FLedgerNew.Free;
   FTree.Free;
@@ -998,6 +1021,7 @@ end;
 type
   TChange = record
     Path, Sha: string;
+    Mark: Integer;
   end;
 
 // fast-import is a byte stream, not a text file: a blob is 'data <count>' followed by exactly
@@ -1023,29 +1047,266 @@ begin
   Result := TTimeZone.Local.ToUniversalTime(Now);
 end;
 
-function TPipeline.EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
-  var Mark: Integer): Boolean;
-// Writes B's content into the stream under a new mark, once per stream. False when the cached
-// file is missing, so the caller leaves that path out instead of referencing a mark that does
-// not exist.
+// ---- what a blob becomes in git ------------------------------------------------------------
+//
+// Normally a blob is written exactly as Team Coherence holds it. A history that was cleaned up
+// after the migration - secrets redacted, certificates removed, large files moved to LFS - has
+// to be continued the same way, or the next update writes back what was taken out. So every
+// blob passes through here: excluded paths are not written at all, content goes through the
+// --filter, and a path .gitattributes stores in LFS gets a pointer instead of its bytes.
+
+function TPipeline.Excluded(const Path: string): Boolean;
 var
-  CacheFile: string;
-  Src: TFileStream;
+  Mask, Name: string;
+begin
+  Name := Path.Substring(Path.LastIndexOf('/') + 1);
+  for Mask in FExcludes do
+    if MatchesMask(Name, Mask) or MatchesMask(Path, Mask) then Exit(True);
+  Result := False;
+end;
+
+function TPipeline.IsLfsPath(const Path: string): Boolean;
+var
+  Re: TRegEx;
+begin
+  for Re in FLfsPatterns do
+    if Re.IsMatch(Path) then Exit(True);
+  Result := False;
+end;
+
+function GitAttrPatternToRegex(Pat: string): string;
+// A .gitattributes pattern as a regex over the repository path. A pattern with a slash is
+// anchored to the root; one without matches a file name at any depth. Bracket expressions,
+// [[:space:]] included, are passed through: PCRE reads them the same way.
+var
+  I, J: Integer;
+  Anchored: Boolean;
+  R: string;
+begin
+  Anchored := Pat.Contains('/');
+  if Pat.StartsWith('/') then Delete(Pat, 1, 1);
+  R := '';
+  I := 1;
+  while I <= Length(Pat) do
+  begin
+    if Pat[I] = '[' then
+    begin
+      J := I + 1;
+      if (J <= Length(Pat)) and (Pat[J] = ']') then Inc(J);
+      while (J <= Length(Pat)) and (Pat[J] <> ']') do
+      begin
+        if (Pat[J] = '[') and (J < Length(Pat)) and (Pat[J + 1] = ':') then
+          J := Pos(':]', Pat, J) + 1;   // a POSIX class such as [:space:]
+        Inc(J);
+      end;
+      R := R + Copy(Pat, I, J - I + 1);
+      I := J + 1;
+    end
+    else if Copy(Pat, I, 3) = '**/' then
+    begin
+      R := R + '(?:.*/)?';
+      Inc(I, 3);
+    end
+    else if Copy(Pat, I, 2) = '**' then
+    begin
+      R := R + '.*';
+      Inc(I, 2);
+    end
+    else
+    begin
+      case Pat[I] of
+        '*': R := R + '[^/]*';
+        '?': R := R + '[^/]';
+      else
+        R := R + TRegEx.Escape(Pat[I]);
+      end;
+      Inc(I);
+    end;
+  end;
+  if Anchored then Result := '^' + R + '$' else Result := '(?:^|/)' + R + '$';
+end;
+
+procedure TPipeline.LoadLfsPatterns(const Commit: string);
+// Which paths the published history keeps in LFS, from .gitattributes at Commit.
+var
+  Out1, Line: string;
+  Parts: TArray<string>;
+  Pats: TList<TRegEx>;
+begin
+  FLfsPatterns := nil;
+  FAttrBlob := '';
+  if GitOut('rev-parse --verify --quiet ' + Commit + ':.gitattributes', Out1) <> 0 then Exit;
+  FAttrBlob := Trim(Out1);
+  if GitOut('cat-file blob ' + FAttrBlob, Out1) <> 0 then
+    raise Exception.Create('Could not read .gitattributes: ' + Trim(Out1));
+  Pats := TList<TRegEx>.Create;
+  try
+    for Line in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+    begin
+      if Line.Trim.StartsWith('#') then Continue;
+      Parts := Line.Trim.Split([' ', #9], TStringSplitOptions.ExcludeEmpty);
+      if (Length(Parts) >= 2) and string.Join(' ', Parts, 1, Length(Parts) - 1).Contains('filter=lfs') then
+        Pats.Add(TRegEx.Create(GitAttrPatternToRegex(Parts[0])));
+    end;
+    FLfsPatterns := Pats.ToArray;
+  finally
+    Pats.Free;
+  end;
+  if Length(FLfsPatterns) > 0 then
+    Log(Format('  .gitattributes keeps %d pattern(s) in LFS; matching files are written as ' +
+      'LFS pointers.', [Length(FLfsPatterns)]));
+end;
+
+function FilterCommand(const Filter: string; out Params: string): string;
+// The program that runs a filter, and its leading parameters. A .pl script is run by Perl -
+// from PATH, or else the one Git for Windows ships beside git.exe, which is where a Windows
+// process will find one.
+var
+  GitExe: string;
+begin
+  Params := '';
+  if not SameText(ExtractFileExt(Filter), '.pl') then Exit(Filter);
+  Params := '"' + Filter + '"';
+  Result := FileSearch('perl.exe', GetEnvironmentVariable('PATH'));
+  if Result <> '' then Exit;
+  GitExe := FileSearch('git.exe', GetEnvironmentVariable('PATH'));
+  if GitExe <> '' then
+  begin
+    Result := TPath.GetFullPath(TPath.Combine(ExtractFilePath(GitExe), '..\usr\bin\perl.exe'));
+    if TFile.Exists(Result) then Exit;
+  end;
+  raise EUpdateRefused.Create('The filter is a Perl script but no perl.exe was found, on ' +
+    'PATH or in Git for Windows.');
+end;
+
+procedure TPipeline.PrepareFiltered(const Shas: TArray<string>);
+// Runs the filter once over every blob in Shas not filtered yet in this run, writing the
+// results to WorkDir\filtered. Batched because a process per blob would cost minutes.
+var
+  Dir, ListFile, Out1, Exe, Params, Sha, Raw, Dest: string;
+  L: TStringList;
+  Pending: TList<string>;
+  Rc: Integer;
+begin
+  if FOpt.Filter = '' then Exit;
+  if not TFile.Exists(FOpt.Filter) then
+    raise EUpdateRefused.CreateFmt('The filter %s does not exist.', [FOpt.Filter]);
+  Dir := TPath.Combine(FOpt.WorkDir, 'filtered');
+  // Never trust an earlier run's output: the rules may have changed since.
+  if (FFiltered.Count = 0) and TDirectory.Exists(Dir) then TDirectory.Delete(Dir, True);
+  TDirectory.CreateDirectory(Dir);
+  L := TStringList.Create;
+  Pending := TList<string>.Create;
+  try
+    for Sha in Shas do
+    begin
+      if FFiltered.ContainsKey(Sha) or Pending.Contains(Sha) then Continue;
+      Raw := TPath.Combine(TPath.Combine(FOpt.CacheDir, Copy(Sha, 1, 2)), Sha);
+      if not TFile.Exists(Raw) then Continue;   // reported where it is used
+      Pending.Add(Sha);
+      L.Add(Raw + #9 + TPath.Combine(Dir, Sha));
+    end;
+    if Pending.Count = 0 then Exit;
+    ListFile := TPath.Combine(Dir, 'list.txt');
+    L.WriteBOM := False;
+    L.SaveToFile(ListFile, TEncoding.UTF8);
+    Exe := FilterCommand(FOpt.Filter, Params);
+    Item(Format('filtering %d file(s)', [Pending.Count]));
+    Rc := RunProcess(Exe, Trim(Params + ' "' + ListFile + '"'), FOpt.WorkDir, Out1, '', False,
+                     7200);
+    if Rc <> 0 then
+      raise Exception.CreateFmt('The content filter failed (exit %d): %s',
+        [Rc, Copy(Trim(Out1), 1, 400)]);
+    for Sha in Pending do
+    begin
+      Dest := TPath.Combine(Dir, Sha);
+      if not TFile.Exists(Dest) then
+        raise Exception.CreateFmt('The content filter wrote no output for %s.', [Sha]);
+      FFiltered.Add(Sha, Dest);
+    end;
+    // The filter's own summary - counts only; a filter must never print what it removed.
+    if Trim(Out1) <> '' then Log('  filter: ' + Trim(Out1).Replace(#13#10, ' / '));
+  finally
+    Pending.Free;
+    L.Free;
+  end;
+end;
+
+function TPipeline.ContentFile(const Sha: string): string;
+// The file whose bytes go into git for this blob: the filtered copy, or the cached original.
+begin
+  Result := TPath.Combine(TPath.Combine(FOpt.CacheDir, Copy(Sha, 1, 2)), Sha);
+  if FOpt.Filter = '' then Exit;
+  if not FFiltered.ContainsKey(Sha) then PrepareFiltered([Sha]);
+  if FFiltered.ContainsKey(Sha) then Result := FFiltered[Sha];
+end;
+
+function TPipeline.LfsPointer(const Sha: string; Store: Boolean): string;
+// The LFS pointer git holds in place of this blob's content. With Store, the content is also
+// put in the repository's LFS store, from where the push uploads it.
+var
+  F, Oid, Obj: string;
+  Size: Int64;
+begin
+  F := ContentFile(Sha);
+  if F.EndsWith(Sha) and not FFiltered.ContainsKey(Sha) then Oid := Sha   // unfiltered
+  else Oid := LowerCase(THashSHA2.GetHashStringFromFile(F, SHA256));
+  Size := TFile.GetSize(F);
+  if Store then
+  begin
+    Obj := TPath.Combine(FOpt.RepoDir, 'lfs\objects\' + Copy(Oid, 1, 2) + '\' + Copy(Oid, 3, 2));
+    TDirectory.CreateDirectory(Obj);
+    Obj := TPath.Combine(Obj, Oid);
+    if not TFile.Exists(Obj) or (TFile.GetSize(Obj) <> Size) then
+    begin
+      TFile.Copy(F, Obj + '.partial', True);
+      if not MoveFileEx(PChar(Obj + '.partial'), PChar(Obj),
+                        MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+        RaiseLastOSError;
+    end;
+  end;
+  Result := 'version https://git-lfs.github.com/spec/v1'#10 +
+            'oid sha256:' + Oid + #10 +
+            'size ' + IntToStr(Size) + #10;
+end;
+
+function TPipeline.EmitBlob(FS: TStream; const B: TBlob; const Path: string;
+  Marks: TDictionary<string, Integer>; var Mark: Integer; out BlobMark: Integer): Boolean;
+// Writes what git holds for B at Path into the stream under a mark - once per stream and form
+// - and returns that mark in BlobMark. False, and the caller writes no M line, for an excluded
+// path or a blob missing from the cache (logged), rather than reference a mark that does not
+// exist.
+const
+  GitHubLimit = Int64(100) * 1024 * 1024;
+var
+  Key, F: string;
+  Lfs: Boolean;
+  Src: TStream;
   LF: Byte;
 begin
-  if Marks.ContainsKey(B.Sha) then Exit(True);
-  CacheFile := TPath.Combine(FOpt.CacheDir,
-    StringReplace(B.CachePath, '/', PathDelim, [rfReplaceAll]));
-  if not TFile.Exists(CacheFile) then
+  BlobMark := 0;
+  if Excluded(Path) then Exit(False);
+  Lfs := IsLfsPath(Path);
+  Key := B.Sha + IfThen(Lfs, '|lfs', '');
+  if Marks.TryGetValue(Key, BlobMark) then Exit(True);
+  F := ContentFile(B.Sha);
+  if not TFile.Exists(F) then
   begin
     Log('  missing cached blob: ' + B.CachePath);
     Exit(False);
   end;
+  // GitHub refuses the whole push over one file this size, after uploading everything else.
+  if FOpt.Push and not Lfs and (TFile.GetSize(F) > GitHubLimit) then
+    raise EUpdateRefused.CreateFmt('%s is %d MB - over GitHub''s 100 MB limit - and ' +
+      '.gitattributes does not keep it in LFS. Nothing was pushed. Add an LFS rule for it ' +
+      'to the published history first.', [Path, TFile.GetSize(F) div (1024 * 1024)]);
   Inc(Mark);
-  Marks.Add(B.Sha, Mark);
+  BlobMark := Mark;
+  Marks.Add(Key, Mark);
   PutLine(FS, 'blob');
   PutLine(FS, 'mark :' + IntToStr(Mark));
-  Src := TFileStream.Create(CacheFile, fmOpenRead or fmShareDenyWrite);
+  if Lfs then Src := TStringStream.Create(LfsPointer(B.Sha, True), TEncoding.ASCII)
+  else Src := TFileStream.Create(F, fmOpenRead or fmShareDenyWrite);
   try
     PutLine(FS, 'data ' + IntToStr(Src.Size));
     FS.CopyFrom(Src, 0);
@@ -1789,7 +2050,7 @@ var
       // already holds is left out: a check-in made of nothing but those makes no commit.
       if FOpt.UpdateMode and FTree.TryGetValue(Chg.Path, Was) and (Was.Sha = Chg.Sha) then
         Continue;
-      if not EmitBlob(FS, FBlobs[N], Marks, Mark) then Continue;
+      if not EmitBlob(FS, FBlobs[N], Chg.Path, Marks, Mark, Chg.Mark) then Continue;
       Pending.Add(Chg);
       if FOpt.UpdateMode then
       begin
@@ -1820,9 +2081,27 @@ var
       Put('from refs/heads/' + FOpt.Branch + '^0');
     FirstCommit := False;
     for N := 0 to Pending.Count - 1 do
-      if Marks.ContainsKey(Pending[N].Sha) then
-        Put(Format('M 100644 :%d %s', [Marks[Pending[N].Sha], Pending[N].Path]));
+      Put(Format('M 100644 :%d %s', [Pending[N].Mark, Pending[N].Path]));
     Pending.Clear;
+  end;
+
+  // One filter run for the whole batch, before any blob is written.
+  procedure FilterBatch;
+  var
+    I, N: Integer;
+    Lst: TList<Integer>;
+    Shas: TList<string>;
+  begin
+    if FOpt.Filter = '' then Exit;
+    Shas := TList<string>.Create;
+    try
+      for I := StartIdx to EndIdx - 1 do
+        if Index.TryGetValue(Format('%d|%s', [FSorted[I].FileID, FSorted[I].Revision]), Lst) then
+          for N in Lst do Shas.Add(FBlobs[N].Sha);
+      PrepareFiltered(Shas.ToArray);
+    finally
+      Shas.Free;
+    end;
   end;
 
 begin
@@ -1835,6 +2114,7 @@ begin
   GroupFiles := TDictionary<Cardinal, Boolean>.Create;
   Index := BlobIndex;
   try
+    FilterBatch;
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn) then
       raise Exception.Create('Could not start git fast-import.');
@@ -1916,6 +2196,35 @@ begin
   if Result = '' then Result := 'unnamed';
 end;
 
+function LabelSignature(const Labels: TArray<TTCLabel>; const Att: TArray<TTCAttachment>;
+  ID: Cardinal): string;
+// What a label is, for telling whether it changed: its name, its comment and exactly which
+// revisions it holds. Not its date - that depends on the zone the metadata was read in, and
+// a label re-applied in TC changes its revisions anyway. '' for a label not in Labels.
+var
+  L: TTCLabel;
+  A: TTCAttachment;
+  Keys: TStringList;
+begin
+  Result := '';
+  for L in Labels do
+    if L.ID = ID then
+    begin
+      Result := L.Name + #1 + L.Comment;
+      Break;
+    end;
+  if Result = '' then Exit;
+  Keys := TStringList.Create;
+  try
+    for A in Att do
+      if A.LabelID = ID then Keys.Add(Format('%d|%s', [A.FileID, A.Revision]));
+    Keys.Sort;
+    Result := Result + #1 + Keys.CommaText;
+  finally
+    Keys.Free;
+  end;
+end;
+
 procedure TPipeline.ImportTags;
 // Rebuilds each version label as its own ref holding the EXACT tree the label describes.
 //
@@ -1941,12 +2250,17 @@ var
   BlobsAt: TObjectDictionary<string, TList<Integer>>; // 'fileid|revision' -> FBlobs indices
   Lst: TList<Integer>;
   I, J, N, Mark, TagCount, Emitted: Integer;
-  Key, Ep, Msg, Out1: string;
-  // one entry per path in this label's tree, as sha + TAB + path. Not a name=value list: git
+  Key, Ep, Msg, Out1, P: string;
+  // one entry per path in this label's tree, as mark + TAB + path. Not a name=value list: git
   // paths here contain spaces and could contain '=', but never a tab.
   Paths: TStringList;
   Parts: TArray<string>;
   UsedRefs: TDictionary<string, Boolean>;
+  Refs: TArray<string>;        // per label: the ref to (re)build, '' to leave alone
+  Unchanged, BlobMark: Integer;
+  HasLfs: Boolean;
+  NowLabels: TArray<TTCLabel>;
+  NowAttach: TArray<TTCAttachment>;
 
   procedure Put(const Line: string);
   begin
@@ -1980,11 +2294,68 @@ begin
         Format('%d|%s', [FSession.Revisions[I].FileID, FSession.Revisions[I].Revision]),
         FSession.Revisions[I].TCPath);
 
-    Log(Format('Rebuilding %d label(s) from %d attachment(s)...',
-      [FSession.Labels.Count, FSession.Attachments.Count]));
+    // ---- which labels to (re)build, and under which ref -----------------------------------
+    // Tags, not branches under the branch. 'refs/heads/tc/main/label/x' cannot exist while
+    // 'refs/heads/tc/main' does: git keeps a ref as a FILE, so the same path cannot also be a
+    // directory. fast-import wrote all 38 label commits and then failed every ref update,
+    // leaving 38 dangling commits and no labels - 21 supervisor retries in a row.
+    //
+    // refs/tags is also the right place semantically: a label IS a named snapshot, and
+    // `git tag` is where anyone looking for "what shipped as v4.2.0" will look first.
+    //
+    // An update rebuilds only labels that changed in TC. The published tags may have been
+    // reworked since they were made - re-dated, redacted, given an LFS .gitattributes - and
+    // rebuilding an unchanged label would move its tag for nothing.
+    SetLength(Refs, FSession.Labels.Count);
+    Unchanged := 0;
+    NowLabels := FSession.Labels.ToArray;
+    NowAttach := FSession.Attachments.ToArray;
+    for I := 0 to FSession.Labels.Count - 1 do
+    begin
+      Refs[I] := '';
+      if FSession.Labels[I].LabelType <> lt_VersionLabel then Continue;
+      Ep := 'refs/tags/' + SanitiseRefName(FSession.Labels[I].Name);
+      // Sanitising can map two different TC names onto one ref ("V 4.2" and "V/4.2"), and
+      // the second would silently replace the first.
+      if UsedRefs.ContainsKey(LowerCase(Ep)) then
+      begin
+        J := 2;
+        while UsedRefs.ContainsKey(LowerCase(Ep + '_' + IntToStr(J))) do Inc(J);
+        Log(Format('  note: "%s" collides with an earlier label; using %s_%d',
+          [FSession.Labels[I].Name, Ep, J]));
+        Ep := Ep + '_' + IntToStr(J);
+      end;
+      UsedRefs.AddOrSetValue(LowerCase(Ep), True);
+      if FOpt.UpdateMode and (LabelSignature(FOldLabels, FOldAttach, FSession.Labels[I].ID) =
+         LabelSignature(NowLabels, NowAttach, FSession.Labels[I].ID)) and
+         (RefSha(Ep) <> '') then
+      begin
+        Inc(Unchanged);
+        Continue;
+      end;
+      Refs[I] := Ep;
+    end;
+    if FOpt.UpdateMode then
+      Log(Format('%d label(s) unchanged in TC keep their tags as published.', [Unchanged]));
 
-    // Forced: these refs belong to this tool, and an unchanged label rebuilds the identical
-    // commit anyway. Only a label re-applied in TC actually moves its tag.
+    // one filter run for every blob the rebuilt labels need
+    if FOpt.Filter <> '' then
+    begin
+      Paths.Clear;
+      for J := 0 to FSession.Attachments.Count - 1 do
+        for I := 0 to FSession.Labels.Count - 1 do
+          if (Refs[I] <> '') and (FSession.Labels[I].ID = FSession.Attachments[J].LabelID) and
+             BlobsAt.TryGetValue(Format('%d|%s', [FSession.Attachments[J].FileID,
+               FSession.Attachments[J].Revision]), Lst) then
+            for N in Lst do Paths.Add(FBlobs[N].Sha);
+      PrepareFiltered(Paths.ToStringArray);
+    end;
+
+    Log(Format('Rebuilding %d label(s) from %d attachment(s)...',
+      [FSession.Labels.Count - Unchanged, FSession.Attachments.Count]));
+
+    // Forced: these refs belong to this tool, and only a label that changed in TC is rebuilt -
+    // to move its tag.
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn, True) then
       raise Exception.Create('Could not start git fast-import for the labels.');
@@ -1995,10 +2366,12 @@ begin
       for I := 0 to FSession.Labels.Count - 1 do
       begin
         if Cancelled then Break;
-        if FSession.Labels[I].LabelType <> lt_VersionLabel then Continue;
+        if Refs[I] = '' then Continue;
+        Ep := Refs[I];
 
         Paths.Clear;
         Emitted := 0;
+        HasLfs := False;
         for J := 0 to FSession.Attachments.Count - 1 do
         begin
           if FSession.Attachments[J].LabelID <> FSession.Labels[I].ID then Continue;
@@ -2008,8 +2381,10 @@ begin
           if not RevPath.ContainsKey(Key) then Continue;
           for N := 0 to Lst.Count - 1 do
           begin
-            if not EmitBlob(FS, FBlobs[Lst[N]], Marks, Mark) then Continue;
-            Paths.Add(FBlobs[Lst[N]].Sha + #9 + MemberPath(RevPath[Key], FBlobs[Lst[N]].Member));
+            P := MemberPath(RevPath[Key], FBlobs[Lst[N]].Member);
+            if not EmitBlob(FS, FBlobs[Lst[N]], P, Marks, Mark, BlobMark) then Continue;
+            Paths.Add(IntToStr(BlobMark) + #9 + P);
+            if IsLfsPath(P) then HasLfs := True;
             Inc(Emitted);
           end;
         end;
@@ -2021,25 +2396,6 @@ begin
         end;
 
         Inc(TagCount);
-        // Tags, not branches under the branch. 'refs/heads/tc/main/label/x' cannot exist while
-        // 'refs/heads/tc/main' does: git keeps a ref as a FILE, so the same path cannot also be
-        // a directory. fast-import wrote all 38 label commits and then failed every ref update,
-        // leaving 38 dangling commits and no labels - 21 supervisor retries in a row.
-        //
-        // refs/tags is also the right place semantically: a label IS a named snapshot, and
-        // `git tag` is where anyone looking for "what shipped as v4.2.0" will look first.
-        Ep := 'refs/tags/' + SanitiseRefName(FSession.Labels[I].Name);
-        // Sanitising can map two different TC names onto one ref ("V 4.2" and "V/4.2"), and the
-        // second would silently replace the first.
-        if UsedRefs.ContainsKey(LowerCase(Ep)) then
-        begin
-          J := 2;
-          while UsedRefs.ContainsKey(LowerCase(Ep + '_' + IntToStr(J))) do Inc(J);
-          Log(Format('  note: "%s" collides with an earlier label; using %s_%d',
-            [FSession.Labels[I].Name, Ep, J]));
-          Ep := Ep + '_' + IntToStr(J);
-        end;
-        UsedRefs.AddOrSetValue(LowerCase(Ep), True);
         Msg := FSession.Labels[I].Name;
         if Trim(FSession.Labels[I].Comment) <> '' then
           Msg := Msg + #10#10 + FSession.Labels[I].Comment;
@@ -2053,8 +2409,11 @@ begin
         begin
           Parts := Paths[J].Split([#9]);
           if Length(Parts) = 2 then
-            Put(Format('M 100644 :%d %s', [Marks[Parts[0]], Parts[1]]));
+            Put(Format('M 100644 :%s %s', [Parts[0], Parts[1]]));
         end;
+        // An LFS pointer is only read as one where .gitattributes says so.
+        if HasLfs and (FAttrBlob <> '') then
+          Put('M 100644 ' + FAttrBlob + ' .gitattributes');
         Log(Format('  %s -> %d file(s)', [Ep, Paths.Count]));
         if (I mod 5 = 0) or (I = FSession.Labels.Count - 1) then
           Progress('Rebuilding labels as refs', I + 1, FSession.Labels.Count);
@@ -2396,16 +2755,15 @@ begin
   end;
 end;
 
-function TPipeline.GitBlobIds(const Shas: TArray<string>): TDictionary<string, string>;
-// sha256, the cache's name for a blob -> the id git gives the same bytes, so the cache can be
-// compared with a tree. git hashes the cached files itself; --no-filters keeps line-ending
-// conversion out of it, exactly as fast-import does. A blob missing from the cache gets no id.
+function TPipeline.GitFileIds(const Files: TArray<string>): TDictionary<string, string>;
+// file -> the id git gives its bytes, so files on disk can be compared with a tree. git hashes
+// them itself; --no-filters keeps line-ending conversion out of it, exactly as fast-import
+// does. A file that does not exist gets no id.
 var
   ListFile, Out1, F: string;
   L: TStringList;
   Present: TList<string>;
   Ids: TArray<string>;
-  Sha: string;
   I: Integer;
 begin
   Result := TDictionary<string, string>.Create;
@@ -2413,13 +2771,14 @@ begin
   L := TStringList.Create;
   try
     try
-      for Sha in Shas do
+      for F in Files do
       begin
-        F := TPath.Combine(TPath.Combine(FOpt.CacheDir, Copy(Sha, 1, 2)), Sha);
-        if not TFile.Exists(F) then Continue;
-        Present.Add(Sha);
+        if Result.ContainsKey(F) or not TFile.Exists(F) then Continue;
+        Result.Add(F, '');   // placeholder: keeps Present free of duplicates
+        Present.Add(F);
         L.Add(F);
       end;
+      Result.Clear;
       if Present.Count = 0 then Exit;
       ListFile := TPath.Combine(FOpt.WorkDir, 'hash-paths.txt');
       L.WriteBOM := False;
@@ -2635,31 +2994,60 @@ begin
 end;
 
 procedure TPipeline.VerifyTree(const Tip: string; Prune: Boolean);
-// The check that makes the record trustworthy: every path at Tip must hold exactly the bytes of
-// the TC revision recorded for it, and nothing else may be there.
+// The check that makes the record trustworthy: every path at Tip must hold exactly what git
+// should hold for the TC revision recorded for it - its bytes after the --filter, or the LFS
+// pointer to them where .gitattributes says so - and nothing else may be there except git's
+// own files (.gitattributes, .gitignore).
 //
 // Prune is for the first update only. The migration's deletion commit removed some paths that
 // the replayed record still has; those are dropped from the record rather than counted.
 var
   AtTip, Ids: TDictionary<string, string>;
+  Expect: TDictionary<string, string>;    // path -> the file holding what git should have
   Shas: TDictionary<string, Boolean>;
-  Rows, Dropped: TStringList;
-  P, Want, Got: string;
+  Rows, Dropped, Own: TStringList;
+  P, Want, Got, PtrDir, PtrFile: string;
   E: TTreeEntry;
+  Excl: Integer;
 begin
   AtTip := TipPaths(Tip);
+  Expect := TDictionary<string, string>.Create;
   Shas := TDictionary<string, Boolean>.Create;
   Rows := TStringList.Create;
   Dropped := TStringList.Create;
+  Own := TStringList.Create;
   Ids := nil;
   try
-    for E in FTree.Values do Shas.AddOrSetValue(E.Sha, True);
-    Ids := GitBlobIds(Shas.Keys.ToArray);
+    // an excluded path is not expected anywhere
+    for P in FTree.Keys do
+      if Excluded(P) then Dropped.Add(P);
+    for P in Dropped do FTree.Remove(P);
+    Excl := Dropped.Count;
+    Dropped.Clear;
+    if Excl > 0 then
+      Log(Format('  %d excluded path(s) are not expected at the tip.', [Excl]));
 
+    for E in FTree.Values do Shas.AddOrSetValue(E.Sha, True);
+    PrepareFiltered(Shas.Keys.ToArray);
+    PtrDir := TPath.Combine(FOpt.WorkDir, 'lfs-pointers');
     for P in FTree.Keys do
     begin
       E := FTree[P];
-      if not Ids.TryGetValue(E.Sha, Want) then Want := '(not in the blob cache)';
+      if IsLfsPath(P) then
+      begin
+        TDirectory.CreateDirectory(PtrDir);
+        PtrFile := TPath.Combine(PtrDir, E.Sha);
+        TFile.WriteAllText(PtrFile, LfsPointer(E.Sha, False), TEncoding.ASCII);
+        Expect.Add(P, PtrFile);
+      end
+      else
+        Expect.Add(P, ContentFile(E.Sha));
+    end;
+    Ids := GitFileIds(Expect.Values.ToArray);
+
+    for P in FTree.Keys do
+    begin
+      if not Ids.TryGetValue(Expect[P], Want) then Want := '(not in the blob cache)';
       if not AtTip.TryGetValue(P, Got) then
       begin
         if Prune then Dropped.Add(P)
@@ -2670,12 +3058,17 @@ begin
     end;
     for P in AtTip.Keys do
       if not FTree.ContainsKey(P) then
-        Rows.Add(Format('%s,(no Team Coherence revision recorded),%s', [CsvQ(P), AtTip[P]]));
+        if P.Substring(P.LastIndexOf('/') + 1).StartsWith('.git') then Own.Add(P)
+        else Rows.Add(Format('%s,(no Team Coherence revision recorded),%s',
+          [CsvQ(P), AtTip[P]]));
 
     for P in Dropped do FTree.Remove(P);
     if Dropped.Count > 0 then
       Log(Format('  %d path(s) removed by the migration''s deletion commit are no longer ' +
         'expected at the tip.', [Dropped.Count]));
+    if Own.Count > 0 then
+      Log(Format('  kept as they are: %s (git''s own, not from Team Coherence)',
+        [string.Join(', ', Own.ToStringArray)]));
 
     if Rows.Count > 0 then
     begin
@@ -2690,10 +3083,14 @@ begin
     Log(Format('Verified: all %d paths at %s hold exactly the Team Coherence content ' +
       'recorded for them.', [FTree.Count, Copy(Tip, 1, 8)]));
   finally
+    if TDirectory.Exists(TPath.Combine(FOpt.WorkDir, 'lfs-pointers')) then
+      TDirectory.Delete(TPath.Combine(FOpt.WorkDir, 'lfs-pointers'), True);
     Ids.Free;
+    Own.Free;
     Dropped.Free;
     Rows.Free;
     Shas.Free;
+    Expect.Free;
     AtTip.Free;
   end;
 end;
@@ -2714,6 +3111,7 @@ begin
   FOldFiles := FSession.Files.ToArray;
   FOldRevs := FSession.Revisions.ToArray;
   FOldAttach := FSession.Attachments.ToArray;
+  FOldLabels := FSession.Labels.ToArray;
 
   First := not TFile.Exists(UpdateStatePath);
   if First then BuildFirstLedger(Recorded) else LoadUpdateState(Recorded);
@@ -2773,6 +3171,8 @@ begin
   else
     Log(Format('No remote "%s" in the repository: this update stays local.', [FOpt.Remote]));
 
+  // what the published history keeps in LFS: needed to know what each path should hold
+  LoadLfsPatterns(Recorded);
   VerifyTree(Recorded, First);
   if First then SaveUpdateCheckpoint;
 end;
@@ -2857,13 +3257,13 @@ procedure TPipeline.FollowMovedFiles;
 var
   NewPath: TDictionary<Cardinal, string>;
   BySha: TDictionary<string, Integer>;
-  Marks: TDictionary<string, Integer>;
+  Marks, MoveMark: TDictionary<string, Integer>;
   Moves: TList<TPair<string, string>>;
   Move: TPair<string, string>;
   Tail: TStringList;
   P, NP, TCPath, Msg, Out1: string;
   E: TTreeEntry;
-  I, Mark, Idx: Integer;
+  I, Mark, Idx, BlobMark: Integer;
   GitProc: TProcessInformation;
   GitIn: THandle;
   FS: TStream;
@@ -2871,6 +3271,7 @@ begin
   NewPath := TDictionary<Cardinal, string>.Create;
   BySha := TDictionary<string, Integer>.Create;
   Marks := TDictionary<string, Integer>.Create;
+  MoveMark := TDictionary<string, Integer>.Create;
   Moves := TList<TPair<string, string>>.Create;
   Tail := TStringList.Create;
   try
@@ -2891,6 +3292,9 @@ begin
 
     for I := 0 to FBlobs.Count - 1 do
       if not BySha.ContainsKey(FBlobs[I].Sha) then BySha.Add(FBlobs[I].Sha, I);
+    for Move in Moves do Tail.Add(FTree[Move.Key].Sha);
+    PrepareFiltered(Tail.ToStringArray);
+    Tail.Clear;
 
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn) then
@@ -2902,12 +3306,15 @@ begin
       for I := Moves.Count - 1 downto 0 do
       begin
         E := FTree[Moves[I].Key];
-        if not BySha.TryGetValue(E.Sha, Idx) or not EmitBlob(FS, FBlobs[Idx], Marks, Mark) then
+        if not BySha.TryGetValue(E.Sha, Idx) or
+           not EmitBlob(FS, FBlobs[Idx], Moves[I].Value, Marks, Mark, BlobMark) then
         begin
-          Log(Format('  cannot move %s: its content is not in the blob cache; left in place',
-            [Moves[I].Key]));
+          Log(Format('  not moving %s: its content is not in the blob cache, or its new path ' +
+            'is excluded; left in place', [Moves[I].Key]));
           Moves.Delete(I);
-        end;
+        end
+        else
+          MoveMark.AddOrSetValue(Moves[I].Key, BlobMark);
       end;
       if Moves.Count > 0 then
       begin
@@ -2923,7 +3330,7 @@ begin
         // every D before any M, so a move onto a path another move vacates is not undone
         for Move in Moves do PutLine(FS, 'D ' + Move.Key);
         for Move in Moves do
-          PutLine(FS, Format('M 100644 :%d %s', [Marks[FTree[Move.Key].Sha], Move.Value]));
+          PutLine(FS, Format('M 100644 :%d %s', [MoveMark[Move.Key], Move.Value]));
       end;
     finally
       FS.Free;
@@ -2950,6 +3357,7 @@ begin
     Tail.Free;
     Moves.Free;
     Marks.Free;
+    MoveMark.Free;
     BySha.Free;
     NewPath.Free;
   end;
@@ -3099,6 +3507,14 @@ begin
   if not RemoteExists then
     raise EUpdateRefused.CreateFmt('There is no remote "%s" to push to. Add it once with: ' +
       'git -C "%s" remote add %s <url>', [FOpt.Remote, FOpt.RepoDir, FOpt.Remote]);
+  // LFS content first: a bare repository has no hook to upload it, and a pushed pointer whose
+  // object never arrived is a file nobody can check out.
+  if Length(FLfsPatterns) > 0 then
+  begin
+    Log(Format('Uploading LFS objects to %s...', [FOpt.Remote]));
+    if GitOut(Format('lfs push --all %s', [FOpt.Remote]), Out1, 6 * 3600) <> 0 then
+      raise Exception.Create('git lfs push failed:'#13#10 + Trim(Out1));
+  end;
   Log(Format('Pushing %s to %s...', [FOpt.Branch, FOpt.Remote]));
   if GitOut(Format('push --porcelain %s refs/heads/%s:refs/heads/%s',
             [FOpt.Remote, FOpt.Branch, FOpt.Branch]), Out1, 6 * 3600) <> 0 then

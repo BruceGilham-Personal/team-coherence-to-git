@@ -70,6 +70,8 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--push` | After a successful run, push the branch (and, with `--tags`, the tags) to the remote |
 | `--remote <name>` | The git remote to check against and push to. Default `origin` |
 | `--state <file>` | The migration's checkpoint file, when it is not `state.txt` in the work folder. Only a first `--update` reads it |
+| `--filter <script>` | A content filter every file passes through before it reaches git - for a published history that was redacted. Run with one argument, a list file of `<input>TAB<output>` lines. A `.pl` script runs under Git for Windows' Perl; `tools\filters\redact-blobs.pl` applies a `rules.pl` of your own |
+| `--exclude <masks>` | `;`-separated masks of paths never written to git, e.g. `*.pfx` |
 
 Exit codes: `0` success, `1` stopped, `2` no session, `3` no such project id, `4` failed,
 `5` refused - the run found something it cannot account for and changed nothing. Retrying
@@ -129,6 +131,21 @@ What an update does:
    still at the tip - so an update with nothing deleted adds no commit for it.
 9. **Pushes**, with `--push`: the branch as a fast-forward, never forced; the tags forced, since
    a moved label must move its tag on the remote too.
+
+**A history reworked after the migration** - re-dated, secrets redacted, certificates
+removed, large files moved to Git LFS - is continued the same way, or the first update would
+put back what was taken out:
+
+- **Redaction:** give the same rules with `--filter`. Every file, from new check-ins and
+  rebuilt labels alike, passes through them, and the content check (step 3) applies them too
+  - so an update refuses unless the filter reproduces the published history byte for byte.
+  Keep the rules file in the work folder, not in this repository.
+- **Removed files:** `--exclude`, e.g. `*.pfx`.
+- **LFS:** read from the tip's `.gitattributes`; matching files are written as LFS pointers,
+  their content stored in the repository's LFS store and uploaded by `git lfs push` before
+  the branch. A new file over GitHub's 100 MB limit that `.gitattributes` does not cover stops
+  a `--push` run rather than fail the push.
+- **Dates:** commits carry the TC zone's own offset, as a history re-dated to that zone does.
 
 An update interrupted at any point continues on the next run: commits not yet recorded in
 `update.txt` are discarded and redone once. Nothing is pushed until a run has finished and

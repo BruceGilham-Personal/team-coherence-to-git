@@ -66,6 +66,11 @@ param(
   # The original migration's checkpoint, when it is not state.txt in -Work (a first -Update
   # reads it to learn what the migration put in git).
   [string] $StateFile = '',
+  # Content filter every file passes through before it reaches git - e.g. a redact-blobs.pl
+  # beside your rules.pl (tools\filters) - for a published history that was redacted.
+  [string] $Filter = '',
+  # ';'-separated masks of paths never written to git, e.g. '*.pfx'.
+  [string] $Exclude = '',
   [int]    $MaxAttempts = 400,
   [int]    $RetrySeconds = 60
 )
@@ -126,6 +131,8 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   if ($NoDll) { $a += '--no-dll' } else { $a += '--dll' }
   if ($Update) { $a += '--update' }
   if ($StateFile) { $a += @('--state', $StateFile) }
+  if ($Filter) { $a += @('--filter', $Filter) }
+  if ($Exclude) { $a += @('--exclude', $Exclude) }
   if ($Push) { $a += @('--push', '--remote', $Remote) }
   $argLine = ($a | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
 

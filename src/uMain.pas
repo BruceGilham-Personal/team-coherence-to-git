@@ -62,6 +62,8 @@ type
     FRemote: string;
     // --state: the migration's checkpoint file, if not state.txt in the work folder.
     FStateFile: string;
+    // --filter: content filter script; --exclude: ';'-separated masks of paths never written.
+    FFilter, FExclude: string;
     FWorker: TMigrationThread;
     // layout metrics, all derived from the rendered font in BuildUi
     FRowH, FBtnH, FPad, FGap, FLineH: Integer;
@@ -270,6 +272,8 @@ begin
     else if A = '--push' then FPush := True
     else if A = '--remote'   then begin FRemote := Next(I); Inc(I); end
     else if A = '--state'    then begin FStateFile := Next(I); Inc(I); end
+    else if A = '--filter'   then begin FFilter := Next(I); Inc(I); end
+    else if A = '--exclude'  then begin FExclude := Next(I); Inc(I); end
     else if A = '--font'     then Inc(I);   // consumed in BuildUi
     ;
     Inc(I);
@@ -1052,6 +1056,8 @@ begin
   Opt.Remote := FRemote;
   Opt.Push := FPush;
   Opt.StateFile := FStateFile;
+  Opt.Filter := FFilter;
+  Opt.Exclude := FExclude;
   Opt.FetchThreads := StrToIntDef(edThreads.Text, 8);
   // Check-ins per resumable batch. Larger batches also give the fetch workers more
   // distinct archives to choose from, which matters because one archive is never fetched
