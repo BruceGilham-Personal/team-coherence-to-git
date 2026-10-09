@@ -263,6 +263,10 @@ begin
     Inc(I);
   end;
 
+  // The password is better taken from the environment than from --pwd: a command line can be
+  // read by anything that lists processes. Run-Migration.ps1 relies on this.
+  if (FTcPwd = '') and (FTcUser <> '') then FTcPwd := GetEnvironmentVariable('TCPWD');
+
   if FAutoLog <> '' then
   begin
     try

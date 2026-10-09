@@ -71,19 +71,34 @@ function Say([string] $msg) {
   Add-Content -LiteralPath $supervisorLog -Value $line
 }
 
+# Start-Process joins -ArgumentList with spaces and quotes nothing, so a work folder such as
+# 'D:\TC Migration' arrived as two arguments. Quote each one the way Delphi's ParamStr reads it
+# back: a quote only toggles quoting and backslashes are always literal, so wrapping in quotes
+# is enough. A value containing a quote cannot be passed at all, and an empty one ("") is
+# skipped by ParamStr, which would shift every argument after it.
+function ConvertTo-QuotedArg([string] $s) {
+  if ($s -eq '') { throw 'A migrator argument cannot be empty.' }
+  if ($s.Contains('"')) { throw "A migrator argument cannot contain a double quote: $s" }
+  if ($s -notmatch '\s') { return $s }
+  return '"' + $s + '"'
+}
+
 Say "supervisor starting: work=$Work threads=$Threads conn=$Conn repo=$Repo tz=$TimeZone tags=$($Tags.IsPresent) dll=$(-not $NoDll.IsPresent)"
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   $log = Join-Path $Work ("migrate-{0:d3}.log" -f $attempt)
+  # No --pwd: the migrator reads TCPWD from the environment it inherits, so the password never
+  # appears on a command line where anything listing processes could read it.
   $a = @(
-    '--auto', '--user', $User, '--pwd', $env:TCPWD,
+    '--auto', '--user', $User,
     '--work', $Work, '--limit', '0', '--threads', "$Threads",
     '--branch', $Branch, '--window', "$Window", '--log', $log, '--repo', $Repo
   )
   if ($Conn) { $a += @('--conn', $Conn) }
-  if ($TimeZone) { $a += @('--tz', "`"$TimeZone`"") }
+  if ($TimeZone) { $a += @('--tz', $TimeZone) }
   if ($Tags) { $a += '--tags' } else { $a += '--no-tags' }
   if ($NoDll) { $a += '--no-dll' } else { $a += '--dll' }
+  $argLine = ($a | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
 
   $before = 0
   $state = Join-Path $Work 'state.txt'
@@ -93,7 +108,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   }
 
   Say "attempt $attempt starting (checkpoint at $before check-ins)"
-  $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -Wait
+  $p = Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -Wait
   $code = $p.ExitCode
 
   $after = 0
