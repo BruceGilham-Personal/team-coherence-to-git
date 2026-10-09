@@ -38,8 +38,8 @@ Settings are remembered in `TCMigrator.ini` in your home folder.
 2. **Reads revision history** — author, date and check-in comment for every revision.
 3. **Matches labels to revisions** — only when tags are enabled. The slowest phase.
 4. **Checks that revision selection works** — see the warning below.
-5. **Fetches file contents** — `tc Get -VR<rev>` per revision into a content-addressed cache,
-   so identical content is stored once.
+5. **Fetches file contents** — through the TC DLL (or `tc Get -VR<rev>` with `--no-dll`) per
+   revision into a content-addressed cache, so identical content is stored once.
 6. **Builds and imports** — writes a `git fast-import` stream and runs it into a bare repository,
    then verifies with `git fsck` and a commit count.
 
