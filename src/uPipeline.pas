@@ -109,7 +109,7 @@ type
     procedure Progress(const Phase: string; Done, Total: Integer);
     function Cancelled: Boolean;
     function RunProcess(const Exe, Params, WorkDir: string; out Output: string;
-      const StdInFile: string = ''): Integer;
+      const StdInFile: string = ''; Utf8: Boolean = False; TimeoutSec: Integer = 300): Integer;
     function GitPathOf(const TCPath: string): string;
     function MemberPath(const TCPath, Member: string): string;
     function SanitiseRefName(const S: string): string;
@@ -223,7 +223,11 @@ end;
 // ---------------------------------------------------------------- process runner
 
 function TPipeline.RunProcess(const Exe, Params, WorkDir: string; out Output: string;
-  const StdInFile: string): Integer;
+  const StdInFile: string; Utf8: Boolean; TimeoutSec: Integer): Integer;
+// Utf8: decode the output as UTF-8 (git) rather than the ANSI code page (tc.exe).
+// TimeoutSec: how long the child may run. Above the default this is a push or a fetch, which
+// can legitimately take an hour, so progress is reported every 30 s to keep the stall
+// watchdog from mistaking it for a hang.
 var
   SA: TSecurityAttributes;
   SI: TStartupInfo;
@@ -232,9 +236,9 @@ var
   Buf: array[0..4095] of AnsiChar;
   Read, Avail: DWORD;
   Cmd, Cwd: string;
-  Res: AnsiString;
+  Res, Chunk: RawByteString;
   WaitRes: DWORD;
-  Deadline: UInt64;
+  Deadline, Started, NextBeat: UInt64;
 begin
   Output := '';
   Res := '';
@@ -275,15 +279,25 @@ begin
     CloseHandle(WritePipe);
     WritePipe := 0;
     try
-      Deadline := GetTickCount64 + 300000;   // 5 minutes: far above the ~11s worst case seen
+      // The default 5 minutes is far above the ~11s worst case seen for a single Get.
+      Started := GetTickCount64;
+      Deadline := Started + UInt64(TimeoutSec) * 1000;
+      NextBeat := Started + 30000;
       repeat
         WaitRes := WaitForSingleObject(PI.hProcess, 50);
-        // drain the pipe so a chatty child cannot deadlock on a full buffer
+        // drain the pipe so a chatty child cannot deadlock on a full buffer. Appended by
+        // length, not as a C string: `git ls-tree -z` output is full of NULs.
         while PeekNamedPipe(ReadPipe, nil, 0, nil, @Avail, nil) and (Avail > 0) do
         begin
-          if not ReadFile(ReadPipe, Buf, SizeOf(Buf) - 1, Read, nil) or (Read = 0) then Break;
-          Buf[Read] := #0;
-          Res := Res + AnsiString(Buf);
+          if not ReadFile(ReadPipe, Buf, SizeOf(Buf), Read, nil) or (Read = 0) then Break;
+          SetString(Chunk, PAnsiChar(@Buf[0]), Read);
+          Res := Res + Chunk;
+        end;
+        if (TimeoutSec > 300) and (GetTickCount64 >= NextBeat) then
+        begin
+          Item(Format('%s still running (%d s)',
+            [ExtractFileName(Exe), (GetTickCount64 - Started) div 1000]));
+          Inc(NextBeat, 30000);
         end;
         // No message pumping here: this runs on a worker thread, and
         // Application.ProcessMessages must only ever be called from the UI thread.
@@ -297,7 +311,7 @@ begin
         if GetTickCount64 > Deadline then
         begin
           TerminateProcess(PI.hProcess, 1);
-          Res := Res + AnsiString(' [timed out after 5 minutes]');
+          Res := Res + RawByteString(Format(' [timed out after %d seconds]', [TimeoutSec]));
           Break;
         end;
       until WaitRes <> WAIT_TIMEOUT;
@@ -311,7 +325,13 @@ begin
     CloseHandle(ReadPipe);
     if StdIn <> INVALID_HANDLE_VALUE then CloseHandle(StdIn);
   end;
-  Output := string(Res);
+  if Utf8 then
+    Output := UTF8ToString(Res)
+  else
+  begin
+    SetCodePage(Res, CP_ACP, False);
+    Output := string(Res);
+  end;
 end;
 
 // ---------------------------------------------------------------- paths
