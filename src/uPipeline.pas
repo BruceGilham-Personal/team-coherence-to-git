@@ -744,11 +744,18 @@ begin
 
       FLock.Enter;
       try
-        // content-addressed: identical content is stored once, whoever gets there first
-        if not TFile.Exists(Dest) then
+        // Content-addressed: identical content is stored once, whoever gets there first.
+        // Written under a temporary name and renamed into place, so a process killed
+        // mid-copy cannot leave a truncated file under the right hash for every later run to
+        // trust. A cached file of the wrong size - left by a version without that rename -
+        // is replaced rather than reused.
+        if not TFile.Exists(Dest) or (TFile.GetSize(Dest) <> B.Size) then
         begin
           TDirectory.CreateDirectory(TPath.Combine(FOpt.CacheDir, RelDir));
-          TFile.Copy(Names[J], Dest, True);
+          TFile.Copy(Names[J], Dest + '.partial', True);
+          if not MoveFileEx(PChar(Dest + '.partial'), PChar(Dest),
+                            MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+            RaiseLastOSError;
         end;
         FBlobs.Add(B);
         FHaveBlob.AddOrSetValue(Format('%d|%s', [B.FileID, B.Revision]), True);
@@ -2174,6 +2181,35 @@ begin
       Log('*** recorded size is what is wrong, and there is nothing here to repair.');
       Rows.Insert(0, 'file_id,tc_path,revision,tc_size,fetched_size');
       Rows.SaveToFile(TPath.Combine(FOpt.MetaDir, 'size_mismatch.csv'), TEncoding.UTF8);
+    end;
+
+    // The sizes above are the ones measured when each revision was fetched. What went into git
+    // is the CACHED copy, so check that too: a file truncated in the cache under the right
+    // hash would otherwise pass the comparison above while git holds the short version.
+    Rows.Clear;
+    Sums.Clear;
+    for I := 0 to FBlobs.Count - 1 do
+    begin
+      if Sums.ContainsKey(FBlobs[I].Sha) then Continue;
+      Key := TPath.Combine(FOpt.CacheDir,
+        StringReplace(FBlobs[I].CachePath, '/', PathDelim, [rfReplaceAll]));
+      if TFile.Exists(Key) then Got := TFile.GetSize(Key) else Got := -1;
+      Sums.Add(FBlobs[I].Sha, Got);
+      if Got <> FBlobs[I].Size then
+        Rows.Add(Format('%s,%d,%d', [FBlobs[I].Sha, FBlobs[I].Size, Got]));
+    end;
+    if Rows.Count = 0 then
+      Log(Format('cached blobs          : all %d match their fetched size', [Sums.Count]))
+    else
+    begin
+      Log('');
+      Log(Format('*** %d cached blob(s) are missing or not the size they were fetched at -',
+        [Rows.Count]));
+      Log('*** listed in meta\cache_mismatch.csv (-1 = missing). Commits built from them are');
+      Log('*** wrong. Delete those cache files, their rows in meta\blobs.csv, state.txt and the');
+      Log('*** repository, then run again: everything else is reused from the cache.');
+      Rows.Insert(0, 'sha256,fetched_size,cached_size');
+      Rows.SaveToFile(TPath.Combine(FOpt.MetaDir, 'cache_mismatch.csv'), TEncoding.UTF8);
     end;
   finally
     Rows.Free;
