@@ -176,6 +176,10 @@ function SetTCTimeZone(const KeyName: string): Boolean;
 function TCTimeZoneName: string;
 function TCWallToUtc(const Wall: TDateTime): TDateTime;
 
+// CSV field quoting and parsing shared by every metadata file.
+function CsvQ(const V: string): string;
+function SplitCsv(const Line: string): TArray<string>;
+
 implementation
 
 uses

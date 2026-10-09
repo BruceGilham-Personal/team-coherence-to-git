@@ -641,7 +641,7 @@ begin
       try
         Inc(FEmpty);
         FSkippedRows.Add(Format('%d,%s,%s,Team Coherence has no stored file for this revision',
-          [R.FileID, R.TCPath, R.Revision]));
+          [R.FileID, CsvQ(R.TCPath), CsvQ(R.Revision)]));
         // Remember it, and persist it: asking the server again on every restart costs a
         // round trip per revision for an answer that can never change.
         FHaveBlob.AddOrSetValue(Format('%d|%s', [R.FileID, R.Revision]), True);
@@ -668,8 +668,8 @@ begin
         else
           Log(Format('  FAILED %s@%s - expected %d bytes, got nothing (after 8 tries)',
             [R.TCPath, R.Revision, R.Size]));
-        FFailedRows.Add(Format('%d,%s,%s,expected %d bytes, nothing returned',
-          [R.FileID, R.TCPath, R.Revision, R.Size]));
+        FFailedRows.Add(Format('%d,%s,%s,"expected %d bytes, nothing returned"',
+          [R.FileID, CsvQ(R.TCPath), CsvQ(R.Revision), R.Size]));
         SuspectLink := (FConsecFail >= 5) and not FConnLost;
       finally
         FLock.Leave;
@@ -722,7 +722,7 @@ begin
       try
         Inc(FEmpty);
         FSkippedRows.Add(Format('%d,%s,%s,metadata size 0 and no content returned',
-          [R.FileID, R.TCPath, R.Revision]));
+          [R.FileID, CsvQ(R.TCPath), CsvQ(R.Revision)]));
       finally
         FLock.Leave;
       end;
@@ -752,8 +752,10 @@ begin
         end;
         FBlobs.Add(B);
         FHaveBlob.AddOrSetValue(Format('%d|%s', [B.FileID, B.Revision]), True);
+        // Member names can contain commas, so every text field is quoted: unquoted, a resumed
+        // run read the wrong columns, lost the cache path and dropped that file's content.
         FManifest.Add(Format('%d,%s,%s,%s,%d,%s',
-          [B.FileID, B.Revision, B.Member, B.Sha, B.Size, B.CachePath]));
+          [B.FileID, CsvQ(B.Revision), CsvQ(B.Member), B.Sha, B.Size, B.CachePath]));
         // Flush often. The fetch window is thousands of revisions wide, and waiting until
         // the end of it would mean a crash left files on disk that no later run knew about.
         if FManifest.Count >= 100 then
@@ -1227,14 +1229,17 @@ begin
     for I := 1 to L.Count - 1 do
     begin
       if L[I] = '' then Continue;
-      C := L[I].Split([',']);
+      C := SplitCsv(L[I]);
       if Length(C) < 6 then Continue;
+      // The fields after the member are fixed, so count them from the end. A row written
+      // before members were quoted has extra columns wherever the member name holds a comma;
+      // read that way, its name is rejoined instead of shifting the sha and cache path.
       B.FileID := StrToUIntDef(C[0], 0);
       B.Revision := C[1];
-      B.Member := C[2];
-      B.Sha := C[3];
-      B.Size := StrToInt64Def(C[4], 0);
-      B.CachePath := C[5];
+      B.Member := string.Join(',', C, 2, Length(C) - 5);
+      B.Sha := C[High(C) - 2];
+      B.Size := StrToInt64Def(C[High(C) - 1], 0);
+      B.CachePath := C[High(C)];
       FBlobs.Add(B);
       FHaveBlob.AddOrSetValue(Format('%d|%s', [B.FileID, B.Revision]), True);
     end;
@@ -1257,9 +1262,11 @@ begin
       for I := 1 to L.Count - 1 do
       begin
         if L[I] = '' then Continue;
-        C := L[I].Split([',']);
-        if Length(C) < 3 then Continue;
-        FHaveBlob.AddOrSetValue(Format('%s|%s', [C[0], C[2]]), True);
+        C := SplitCsv(L[I]);
+        if Length(C) < 4 then Continue;
+        // file_id,tc_path,revision,reason. The reason holds no comma, so the revision is
+        // second from the end - which also reads older rows whose path was not quoted.
+        FHaveBlob.AddOrSetValue(Format('%s|%s', [C[0], C[High(C) - 1]]), True);
         Inc(Known);
       end;
       if Known > 0 then
