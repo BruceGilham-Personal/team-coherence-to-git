@@ -132,7 +132,7 @@ type
     property OnCancel: TCancelFunc read FOnCancel write FOnCancel;
 
     procedure ImportTags;
-    function CheckRevisionSelection(const TCPath: string): Boolean;
+    function CheckRevisionSelection(out Probe: string): Boolean;
     function GetCurrentView: string;
     function SetView(const ViewName: string): Boolean;
   public
@@ -392,29 +392,77 @@ end;
 
 // -+ safety gate
 
-function TPipeline.CheckRevisionSelection(const TCPath: string): Boolean;
+function TPipeline.CheckRevisionSelection(out Probe: string): Boolean;
+// The active View decides what -VR means. Under some views every -VR quietly returns the TIP,
+// which would fill the repository with tip content for every revision. Prove that an
+// impossible revision FAILS before trusting any of it.
+//
+// The probe goes through the SAME path the fetch will use. It used to ask tc.exe even when the
+// DLL was doing the fetching, so the path that actually ran was never tested. And an
+// impossible revision failing proves nothing unless a real one of the same file succeeds:
+// tc.exe misreads a path with a space and fails for that reason alone, so probe files are
+// chosen without one, and a file whose real revision does not come back is passed over.
+const
+  MaxCandidates = 5;
 var
   DirA, DirB, Out1: string;
-  RcB: Integer;
-  GotB: Integer;
-begin
-  // The active View decides what -VR means. Under some views every -VR quietly returns the
-  // TIP, which would fill the repository with tip content for every revision. Prove that an
-  // impossible revision FAILS before trusting any of it.
-  DirA := TPath.Combine(FOpt.WorkDir, 'probe-a');
-  DirB := TPath.Combine(FOpt.WorkDir, 'probe-b');
-  TDirectory.CreateDirectory(DirA);
-  TDirectory.CreateDirectory(DirB);
-  try
-    RunProcess(FOpt.TcExe, Format('Get "%s" "-GL%s" -W -T', [TCPath, DirA]), FOpt.WorkDir, Out1);
-    RcB := RunProcess(FOpt.TcExe, Format('Get "%s" -VR99.99 "-GL%s" -W -T', [TCPath, DirB]),
-                      FOpt.WorkDir, Out1);
-    GotB := Length(TDirectory.GetFiles(DirB, '*', TSearchOption.soAllDirectories));
-    Result := not ((RcB = 0) and (GotB > 0));
-  finally
-    TDirectory.Delete(DirA, True);
-    TDirectory.Delete(DirB, True);
+  RcA, RcB, GotA, GotB, I, Tried: Integer;
+  R: TTCRevision;
+  Seen: TDictionary<Cardinal, Boolean>;
+
+  function Fetch(const Rev, Dir: string): Integer;
+  begin
+    if FOpt.UseDll then
+      Result := FSession.GetRevisionContent(R.FileID, Rev, Dir)
+    else
+      Result := RunProcess(FOpt.TcExe, Format('Get "%s" -VR%s "-GL%s" -W -T',
+                           [R.TCPath, Rev, Dir]), FOpt.WorkDir, Out1);
   end;
+
+  function Fresh(const Name: string): string;
+  begin
+    Result := TPath.Combine(FOpt.WorkDir, Name);
+    if TDirectory.Exists(Result) then TDirectory.Delete(Result, True);
+    TDirectory.CreateDirectory(Result);
+  end;
+
+begin
+  Probe := '';
+  Tried := 0;
+  Seen := TDictionary<Cardinal, Boolean>.Create;
+  try
+    for I := FSession.Revisions.Count - 1 downto 0 do
+    begin
+      R := FSession.Revisions[I];
+      if (R.Size <= 0) or (Pos(' ', R.TCPath) > 0) or Seen.ContainsKey(R.FileID) then Continue;
+      Seen.Add(R.FileID, True);
+      Inc(Tried);
+      Probe := Format('%s @ %s', [R.TCPath, R.Revision]);
+      DirA := Fresh('probe-a');
+      DirB := Fresh('probe-b');
+      try
+        RcA := Fetch(R.Revision, DirA);
+        GotA := Length(TDirectory.GetFiles(DirA, '*', TSearchOption.soAllDirectories));
+        if (RcA = 0) and (GotA > 0) then
+        begin
+          RcB := Fetch('99.99', DirB);
+          GotB := Length(TDirectory.GetFiles(DirB, '*', TSearchOption.soAllDirectories));
+          Exit(not ((RcB = 0) and (GotB > 0)));
+        end;
+        Log(Format('  probe: %s did not come back (code %d) - trying another file',
+          [Probe, RcA]));
+      finally
+        TDirectory.Delete(DirA, True);
+        TDirectory.Delete(DirB, True);
+      end;
+      if Tried >= MaxCandidates then Break;
+    end;
+  finally
+    Seen.Free;
+  end;
+  raise Exception.CreateFmt(
+    'The revision-selection probe could not fetch a known revision of any of %d file(s), so ' +
+    'it proves nothing. Check the connection and run again.', [Tried]);
 end;
 
 // ---------------------------------------------------------------- fetch (parallel)

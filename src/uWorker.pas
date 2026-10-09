@@ -368,13 +368,13 @@ begin
         Phase('Checking that revision selection works');
         if FSession.Files.Count = 0 then
           raise Exception.Create('No files were found - nothing to migrate.');
-        Probe := FSession.Files[0].TCPath;
         if not Pipe.CheckRevisionSelection(Probe) then
           raise Exception.Create(
             'This client returns the TIP for any revision requested, so every revision would '
             + 'be stored with today''s content.'#13#10#13#10
             + 'Switch the Team Coherence view to <default> and run again.');
-        QLog('Revision selection confirmed: an impossible revision is correctly rejected.');
+        QLog(Format('Revision selection confirmed on %s: a real revision is fetched and an ' +
+          'impossible one is rejected.', [Probe]));
       end;
 
       if not Terminated then
