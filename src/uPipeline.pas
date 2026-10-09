@@ -147,7 +147,7 @@ implementation
 
 uses
   System.Hash, System.IOUtils, System.DateUtils, System.StrUtils,
-  System.Generics.Defaults, Winapi.WinSock;
+  System.Generics.Defaults;
 
 constructor TPipeline.Create(ASession: TTCSession; const AOpt: TPipelineOptions);
 begin
@@ -1111,41 +1111,10 @@ begin
 end;
 
 function TPipeline.ServerAnswers: Boolean;
-// A plain TCP connect, so a down link costs a second rather than a hung Get.
-var
-  WSA: TWSAData;
-  Sock: TSocket;
-  Addr: TSockAddrIn;
-  Mode: u_long;
-  FDs: TFDSet;
-  TV: TTimeVal;
+// A plain TCP connect, so a down link costs a few seconds rather than a hung Get. The same
+// check the login makes, including resolving a host name.
 begin
-  Result := True;
-  if (FSession.Host = '') or (FSession.Port = 0) then Exit;
-  if WSAStartup($0202, WSA) <> 0 then Exit;
-  try
-    Sock := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if Sock = INVALID_SOCKET then Exit;
-    try
-      FillChar(Addr, SizeOf(Addr), 0);
-      Addr.sin_family := AF_INET;
-      Addr.sin_port := htons(FSession.Port);
-      Addr.sin_addr.S_addr := inet_addr(PAnsiChar(AnsiString(FSession.Host)));
-      if Addr.sin_addr.S_addr = INADDR_NONE then Exit;
-      Mode := 1;
-      ioctlsocket(Sock, FIONBIO, Mode);
-      if connect(Sock, TSockAddr(Addr), SizeOf(Addr)) = 0 then Exit(True);
-      FD_ZERO(FDs);
-      FD_SET(Sock, FDs);
-      TV.tv_sec := 3;
-      TV.tv_usec := 0;
-      Result := select(0, nil, @FDs, nil, @TV) > 0;
-    finally
-      closesocket(Sock);
-    end;
-  finally
-    WSACleanup;
-  end;
+  Result := FSession.ServerReachable(3000);
 end;
 
 procedure TPipeline.ReAnchorFolder;

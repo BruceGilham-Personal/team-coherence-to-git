@@ -650,6 +650,9 @@ function TTCSession.ServerReachable(TimeoutMs: Integer): Boolean;
 // This exists because TCVcsLogin BLOCKS INDEFINITELY when the server cannot be reached - it
 // does not fail, it just never returns, and the application looks hung. Checking the socket
 // first turns "frozen forever" into a clear message in about a second.
+//
+// Also the fetch heartbeat's test (TPipeline), so it is safe to call from any thread: it
+// touches only the socket API, never the TC DLL.
 var
   WSA: TWSAData;
   Sock: TSocket;
@@ -658,20 +661,33 @@ var
   FDs: TFDSet;
   TV: TTimeVal;
   Rc: Integer;
+  HostA: AnsiString;
+  HE: PHostEnt;
 begin
   Result := False;
   if (FHost = '') or (FPort = 0) then Exit(True);   // nothing to test against; let it try
 
   if WSAStartup($0202, WSA) <> 0 then Exit(True);
   try
+    FillChar(Addr, SizeOf(Addr), 0);
+    Addr.sin_family := AF_INET;
+    Addr.sin_port := htons(FPort);
+    HostA := AnsiString(FHost);
+    Addr.sin_addr.S_addr := inet_addr(PAnsiChar(HostA));
+    // A name, not an address, so resolve it. S_addr is signed and INADDR_NONE is not: the
+    // plain comparison that used to be here widened both and was never true, so a host name
+    // went to connect() as 255.255.255.255 and the server always looked unreachable. A name
+    // that will not resolve is unreachable: the TC client uses the same resolver.
+    if DWORD(Addr.sin_addr.S_addr) = INADDR_NONE then
+    begin
+      HE := gethostbyname(PAnsiChar(HostA));
+      if (HE = nil) or (HE^.h_addrtype <> AF_INET) or (HE^.h_addr_list^ = nil) then Exit(False);
+      Addr.sin_addr.S_addr := PInAddr(HE^.h_addr_list^)^.S_addr;
+    end;
+
     Sock := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if Sock = INVALID_SOCKET then Exit(True);
     try
-      FillChar(Addr, SizeOf(Addr), 0);
-      Addr.sin_family := AF_INET;
-      Addr.sin_port := htons(FPort);
-      Addr.sin_addr.S_addr := inet_addr(PAnsiChar(AnsiString(FHost)));
-      if Addr.sin_addr.S_addr = INADDR_NONE then Exit(True);   // a name, not an address
 
       Mode := 1;                       // non-blocking, so connect() cannot hang
       ioctlsocket(Sock, FIONBIO, Mode);
