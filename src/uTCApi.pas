@@ -181,6 +181,8 @@ function TCTimeZoneName: string;
 // The Windows key in use, resolved even when it is this PC's zone.
 function TCTimeZoneKey: string;
 function TCWallToUtc(const Wall: TDateTime): TDateTime;
+// The TC zone's UTC offset at a UTC instant, as git writes it: '-0500', '+0100'.
+function TCUtcOffset(const Utc: TDateTime): string;
 
 // CSV field quoting and parsing shared by every metadata file.
 function CsvQ(const V: string): string;
@@ -305,21 +307,40 @@ begin
   if GTCZoneIsLocal then Result := Result + ' (this PC)';
 end;
 
-function TCWallToUtc(const Wall: TDateTime): TDateTime;
-var
-  Y: Integer;
-  L, U: TSystemTime;
+// Loads the zone's rules for year Y into GTCZoneTZI, unless they are already there.
+procedure UseZoneYear(Y: Integer);
 begin
   if (GTCZoneKey = '') and not SetTCTimeZone('') then RaiseLastOSError;
-  Y := YearOf(Wall);
   if Y <> GTCZoneYear then
   begin
     if not GetTimeZoneInformationForYear(Y, @GTCZoneDTZI, GTCZoneTZI) then RaiseLastOSError;
     GTCZoneYear := Y;
   end;
+end;
+
+function TCWallToUtc(const Wall: TDateTime): TDateTime;
+var
+  L, U: TSystemTime;
+begin
+  UseZoneYear(YearOf(Wall));
   DateTimeToSystemTime(Wall, L);
   if not TzSpecificLocalTimeToSystemTime(@GTCZoneTZI, L, U) then RaiseLastOSError;
   Result := SystemTimeToDateTime(U);
+end;
+
+function TCUtcOffset(const Utc: TDateTime): string;
+// Commits used to say +0000 for every date. The instant was right, but git shows each date in
+// its own offset, so the history read as if checked in from London - and differed from a
+// history re-dated to the TC server's zone, whose commits carry that zone's offset.
+var
+  U, L: TSystemTime;
+  Mins: Integer;
+begin
+  UseZoneYear(YearOf(Utc));
+  DateTimeToSystemTime(Utc, U);
+  if not SystemTimeToTzSpecificLocalTime(@GTCZoneTZI, U, L) then RaiseLastOSError;
+  Mins := Round((SystemTimeToDateTime(L) - Utc) * MinsPerDay);
+  Result := Format('%s%.2d%.2d', [IfThen(Mins < 0, '-', '+'), Abs(Mins) div 60, Abs(Mins) mod 60]);
 end;
 
 function TCDateToDT(TS: Integer): TDateTime;

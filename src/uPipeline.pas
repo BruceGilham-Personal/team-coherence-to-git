@@ -935,6 +935,18 @@ begin
   FS.WriteBuffer(B[0], Length(B));
 end;
 
+// The time part of a fast-import committer line for a UTC instant: Unix seconds, then the TC
+// zone's offset at that moment, so git shows each date as the TC server's clock did.
+function GitStamp(const Utc: TDateTime): string;
+begin
+  Result := Format('%d %s', [DateTimeToUnix(Utc, True), TCUtcOffset(Utc)]);
+end;
+
+function NowUtc: TDateTime;
+begin
+  Result := TTimeZone.Local.ToUniversalTime(Now);
+end;
+
 function TPipeline.EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
   var Mark: Integer): Boolean;
 // Writes B's content into the stream under a new mark, once per stream. False when the cached
@@ -1715,8 +1727,8 @@ var
     Msg := GroupComment;
     if Trim(Msg) = '' then Msg := '(no check-in comment)';
     Put('commit refs/heads/' + FOpt.Branch);
-    Put(Format('committer %s %d +0000',
-      [MapAuthor(GroupAuthor), DateTimeToUnix(GroupStart, True)]));
+    Put(Format('committer %s %s',
+      [MapAuthor(GroupAuthor), GitStamp(GroupStart)]));
     Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
     Put(Msg);
     // Continue the existing history: without this the first commit of a resumed run would
@@ -1947,8 +1959,8 @@ begin
         if Trim(FSession.Labels[I].Comment) <> '' then
           Msg := Msg + #10#10 + FSession.Labels[I].Comment;
         Put('commit ' + Ep);
-        Put(Format('committer %s %d +0000',
-          [MapAuthor('tc'), DateTimeToUnix(FSession.Labels[I].When, True)]));
+        Put(Format('committer %s %s',
+          [MapAuthor('tc'), GitStamp(FSession.Labels[I].When)]));
         Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
         Put(Msg);
         Put('deleteall');   // a label defines the whole tree, not a delta
@@ -2136,8 +2148,8 @@ begin
     FS := THandleStream.Create(GitIn);
     try
       Put('commit refs/heads/' + FOpt.Branch);
-      Put(Format('committer %s %d +0000',
-        [MapAuthor('tc'), DateTimeToUnix(Now, False)]));
+      Put(Format('committer %s %s',
+        [MapAuthor('tc'), GitStamp(NowUtc)]));
       Line := Format('Remove %d files deleted in Team Coherence' + #10 + #10 +
         'These files no longer exist in the Team Coherence repository. TC records no ' +
         'deletion event that can be dated, so they are removed here in a single commit ' +
