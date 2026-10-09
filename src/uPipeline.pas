@@ -88,6 +88,7 @@ type
     procedure WriteCheckpoint(Index: Integer; const Extra: string);
     procedure LoadBlobManifest;
     procedure RewindToCheckpointTip;
+    procedure DiscardUncheckpointedBranch;
     function BlobIndex: TObjectDictionary<string, TList<Integer>>;
     function EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
       var Mark: Integer): Boolean;
@@ -1219,6 +1220,24 @@ begin
   end;
 end;
 
+procedure TPipeline.DiscardUncheckpointedBranch;
+// The first-batch case of RewindToCheckpointTip. With no check-in recorded there is no tip to
+// rewind to, so a branch that already exists holds only commits from an import that never
+// reached its checkpoint - and the next import would add the same batch again on top of it.
+var
+  Actual: string;
+begin
+  RunProcess(FOpt.GitExe, 'rev-parse --verify --quiet refs/heads/' + FOpt.Branch,
+             FOpt.RepoDir, Actual);
+  Actual := Trim(Actual);
+  if Actual = '' then Exit;
+  Log(Format('Branch %s exists at %s but no check-in was ever recorded - deleting it so the',
+    [FOpt.Branch, Copy(Actual, 1, 8)]));
+  Log('interrupted first batch is redone once rather than duplicated.');
+  RunProcess(FOpt.GitExe, Format('update-ref -d refs/heads/%s %s', [FOpt.Branch, Actual]),
+             FOpt.RepoDir, FLastOut);
+end;
+
 procedure TPipeline.LoadBlobManifest;
 var
   L: TStringList;
@@ -1527,7 +1546,7 @@ begin
     Log(Format('Fetching content by spawning tc.exe, %d worker(s).', [FOpt.FetchThreads]));
   FOverallTotal := Total;
   FOverallBase := Idx;
-  if Idx > 0 then RewindToCheckpointTip;
+  if Idx > 0 then RewindToCheckpointTip else DiscardUncheckpointedBranch;
   if Idx > 0 then
     Log(Format('Resuming from check-in %d of %d (previous run stopped there).', [Idx, Total]))
   else
