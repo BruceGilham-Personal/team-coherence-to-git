@@ -100,7 +100,6 @@ type
     procedure AppendSkipped(const Rows: TArray<string>);
     procedure MergeSaveCsv(const Name, Header: string; Rows: TStrings);
     procedure ImportRange(StartIdx, EndIdx: Integer);
-    function FileIdOf(const TCPath: string): Cardinal;
     function StartFastImport(out ProcInfo: TProcessInformation; out StdInWrite: THandle): Boolean;
     function FinishFastImport(var ProcInfo: TProcessInformation; var StdInWrite: THandle;
       out Output: string): Integer;
@@ -1977,29 +1976,42 @@ procedure TPipeline.RemoveDeletedFiles;
 // What CAN be established is which files no longer exist NOW. Each folder is listed and any
 // file missing from it is deleted in one final commit. The deletion dates are unknown, so this
 // is honest about being a tip correction rather than pretending to be history.
+//
+// A file is removed only when its folder's listing is TRUSTED. A failed `tc Dir`, or one that
+// quietly listed some other folder, used to make every file in that folder look deleted. So a
+// folder is skipped - its files kept - when the command fails, when its path has a space
+// (tc.exe cannot parse one and lists the current folder instead), or when the listing names
+// none of the files known to be in it. The cost is that a folder whose files were ALL deleted
+// keeps them; those folders are logged.
 var
   Present: TDictionary<string, Boolean>;
-  Folders: TList<string>;
-  I, J, Removed: Integer;
-  Output, FolderPath, Line, Name: string;
+  ByFolder: TObjectDictionary<string, TList<Integer>>;   // lower-case folder -> Files indices
+  Folders: TStringList;
+  GoneIds, Live: TDictionary<Cardinal, string>;           // file id -> TC path
+  DelPaths: TStringList;
+  Lst: TList<Integer>;
+  I, J, Rc, Seen: Integer;
+  Output, FolderPath, Line, Name, Why, TCPath: string;
   Lines: TArray<string>;
   GitProc: TProcessInformation;
   GitIn: THandle;
   FS: TStream;
-  Gone: TStringList;
+  Gone, Unchecked: TStringList;
 
   procedure Put(const S: string);
-  var
-    B: TBytes;
   begin
-    B := TEncoding.UTF8.GetBytes(S + #10);
-    FS.WriteBuffer(B[0], Length(B));
+    PutLine(FS, S);
   end;
 
 begin
   Present := TDictionary<string, Boolean>.Create;
-  Folders := TList<string>.Create;
+  ByFolder := TObjectDictionary<string, TList<Integer>>.Create([doOwnsValues]);
+  Folders := TStringList.Create;
+  GoneIds := TDictionary<Cardinal, string>.Create;
+  Live := TDictionary<Cardinal, string>.Create;
+  DelPaths := TStringList.Create;
   Gone := TStringList.Create;
+  Unchecked := TStringList.Create;
   try
     // every distinct folder that holds a migrated file
     for I := 0 to FSession.Files.Count - 1 do
@@ -2007,7 +2019,13 @@ begin
       FolderPath := FSession.Files[I].TCPath;
       J := LastDelimiter('/', FolderPath);
       if J > 0 then FolderPath := Copy(FolderPath, 1, J - 1);
-      if Folders.IndexOf(FolderPath) < 0 then Folders.Add(FolderPath);
+      if not ByFolder.TryGetValue(LowerCase(FolderPath), Lst) then
+      begin
+        Lst := TList<Integer>.Create;
+        ByFolder.Add(LowerCase(FolderPath), Lst);
+        Folders.Add(FolderPath);
+      end;
+      Lst.Add(I);
     end;
     Log(Format('Checking %d folders for files that no longer exist...', [Folders.Count]));
 
@@ -2015,24 +2033,55 @@ begin
     begin
       if Cancelled then Exit;
       WaitIfPaused;
-      RunProcess(FOpt.TcExe, Format('Dir "%s"', [Folders[I]]), FOpt.WorkDir, Output);
-      Lines := Output.Split([#13, #10]);
-      for Line in Lines do
+      Lst := ByFolder[LowerCase(Folders[I])];
+      Why := '';
+      if Pos(' ', Folders[I]) > 0 then
+        Why := 'path has a space, which tc.exe cannot list'
+      else
       begin
-        Name := Trim(Line);
-        // folder entries are indented and have no extension; skip headers and counts
-        if (Name = '') or Name.StartsWith('//') or Name.EndsWith(':') or
-           (Pos('item(s)', Name) > 0) or (Pos('Team Coherence', Name) > 0) or
-           (Pos('Copyright', Name) > 0) or (Pos('.exe"', Name) > 0) then Continue;
-        Present.AddOrSetValue(LowerCase(Folders[I] + '/' + Name), True);
+        Rc := RunProcess(FOpt.TcExe, Format('Dir "%s"', [Folders[I]]), FOpt.WorkDir, Output);
+        if Rc <> 0 then
+          Why := Format('tc Dir failed (exit %d)', [Rc])
+        else
+        begin
+          Present.Clear;
+          Lines := Output.Split([#13, #10]);
+          for Line in Lines do
+          begin
+            Name := Trim(Line);
+            // folder entries are indented and have no extension; skip headers and counts
+            if (Name = '') or Name.StartsWith('//') or Name.EndsWith(':') or
+               (Pos('item(s)', Name) > 0) or (Pos('Team Coherence', Name) > 0) or
+               (Pos('Copyright', Name) > 0) or (Pos('.exe"', Name) > 0) then Continue;
+            Present.AddOrSetValue(LowerCase(Folders[I] + '/' + Name), True);
+          end;
+          Seen := 0;
+          for J in Lst do
+            if Present.ContainsKey(LowerCase(FSession.Files[J].TCPath)) then Inc(Seen);
+          if Seen = 0 then
+            Why := 'the listing names none of its known files'
+          else
+            for J in Lst do
+              if not Present.ContainsKey(LowerCase(FSession.Files[J].TCPath)) then
+              begin
+                Gone.Add(FSession.Files[J].TCPath);
+                GoneIds.AddOrSetValue(FSession.Files[J].ID, FSession.Files[J].TCPath);
+              end;
+        end;
       end;
+      if Why <> '' then
+        Unchecked.Add(Format('%s,%d,%s', [CsvQ(Folders[I]), Lst.Count, Why]));
       if (I mod 25 = 0) or (I = Folders.Count - 1) then
         Progress('Looking for deleted files', I + 1, Folders.Count);
     end;
 
-    for I := 0 to FSession.Files.Count - 1 do
-      if not Present.ContainsKey(LowerCase(FSession.Files[I].TCPath)) then
-        Gone.Add(FSession.Files[I].TCPath);
+    if Unchecked.Count > 0 then
+    begin
+      Log(Format('  %d folder(s) could not be checked reliably; their files are KEPT at the ' +
+        'tip. Listed in meta\deleted_unchecked.csv.', [Unchecked.Count]));
+      Unchecked.Insert(0, 'tc_folder,file_count,reason');
+      Unchecked.SaveToFile(TPath.Combine(FOpt.MetaDir, 'deleted_unchecked.csv'), TEncoding.UTF8);
+    end;
 
     if Gone.Count = 0 then
     begin
@@ -2043,6 +2092,26 @@ begin
     Log(Format('%d file(s) no longer exist in Team Coherence; removing them at the tip.',
       [Gone.Count]));
     Gone.SaveToFile(TPath.Combine(FOpt.MetaDir, 'deleted.csv'));
+
+    // every path each deleted archive ever produced (all members of its file group), once
+    DelPaths.Sorted := True;
+    DelPaths.Duplicates := dupIgnore;
+    for I := 0 to Gone.Count - 1 do
+      DelPaths.Add(GitPathOf(Gone[I]));
+    for J := 0 to FBlobs.Count - 1 do
+      if GoneIds.TryGetValue(FBlobs[J].FileID, TCPath) then
+        DelPaths.Add(MemberPath(TCPath, FBlobs[J].Member));
+    // ...except any path an archive that still exists also writes: deleting it would remove
+    // live content from the tip.
+    for I := 0 to FSession.Files.Count - 1 do
+      if not GoneIds.ContainsKey(FSession.Files[I].ID) then
+        Live.AddOrSetValue(FSession.Files[I].ID, FSession.Files[I].TCPath);
+    for J := 0 to FBlobs.Count - 1 do
+      if Live.TryGetValue(FBlobs[J].FileID, TCPath) then
+      begin
+        Rc := DelPaths.IndexOf(MemberPath(TCPath, FBlobs[J].Member));
+        if Rc >= 0 then DelPaths.Delete(Rc);
+      end;
 
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn) then
@@ -2060,18 +2129,8 @@ begin
       Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Line))));
       Put(Line);
       Put('from refs/heads/' + FOpt.Branch + '^0');
-      Removed := 0;
-      for I := 0 to Gone.Count - 1 do
-      begin
-        // delete every member path of the archive's file group
-        for J := 0 to FBlobs.Count - 1 do
-          if FBlobs[J].FileID = FileIdOf(Gone[I]) then
-          begin
-            Put('D ' + MemberPath(Gone[I], FBlobs[J].Member));
-            Inc(Removed);
-          end;
-        Put('D ' + GitPathOf(Gone[I]));
-      end;
+      for I := 0 to DelPaths.Count - 1 do
+        Put('D ' + DelPaths[I]);
     finally
       FS.Free;
     end;
@@ -2080,21 +2139,17 @@ begin
       Log('deletion commit failed: ' + Output);
       raise Exception.Create('git fast-import failed on the deletion commit.');
     end;
-    Log(Format('Removed %d path(s) at the tip.', [Removed + Gone.Count]));
+    Log(Format('Removed %d path(s) at the tip.', [DelPaths.Count]));
   finally
     Present.Free;
+    ByFolder.Free;
     Folders.Free;
+    GoneIds.Free;
+    Live.Free;
+    DelPaths.Free;
     Gone.Free;
+    Unchecked.Free;
   end;
-end;
-
-function TPipeline.FileIdOf(const TCPath: string): Cardinal;
-var
-  I: Integer;
-begin
-  Result := 0;
-  for I := 0 to FSession.Files.Count - 1 do
-    if FSession.Files[I].TCPath = TCPath then Exit(FSession.Files[I].ID);
 end;
 
 // ---------------------------------------------------------------- verify
