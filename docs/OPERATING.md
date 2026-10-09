@@ -63,7 +63,7 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--window <seconds>` | Check-in grouping window |
 | `--authors <file>` | Author map |
 | `--tcbin <dir>` | TC client Bin folder |
-| `--tz "<zone>"` | Windows time zone of the **TC server's** clock, e.g. `"Eastern Standard Time"` (`Get-TimeZone -ListAvailable`). TC stores wall-clock time with no zone; omitted, this PC's zone is assumed, and every commit is off by the difference |
+| `--tz "<zone>"` | Windows time zone of the **TC server's** clock, e.g. `"Eastern Standard Time"` (`Get-TimeZone -ListAvailable`). TC stores wall-clock time with no zone; omitted, this PC's zone is assumed, and every commit is off by the difference. Dates are converted when the history is first read and saved in `meta\`, which records the zone in `meta\timezone.txt`; a later run with a different zone stops rather than mix the two. To change zone, delete `meta\` and the repository |
 | `--log <file>` | Write the on-screen log to this file on exit |
 
 Exit codes: `0` success, `1` stopped, `2` no session, `3` no such project id, `4` failed.

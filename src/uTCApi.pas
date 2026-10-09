@@ -115,6 +115,10 @@ type
     FOnItem: TLogProc;
     FOnProgress: TProgressProc;
     FOnCancel: TCancelFunc;
+    // The time zone key the loaded revision and label dates were converted with: the current
+    // one after a fresh enumeration, the one stamped in meta\timezone.txt after LoadCsvs, or
+    // '' when reloaded metadata predates the stamp and the zone is unknown.
+    FDatesZone: string;
     function Api(const Name: string): Pointer;
     procedure Log(const Msg: string);
     procedure Item(const Detail: string);   // "what is happening right now", not logged
@@ -858,6 +862,7 @@ begin
     CheckCallbackError;
     Progress('Reading revision history', I + 1, Files.Count);
   end;
+  FDatesZone := TCTimeZoneKey;
   Log(Format('Revisions: %d', [Revisions.Count]));
 end;
 
@@ -1281,6 +1286,25 @@ begin
   Result := TFile.Exists(FilesCsv) and TFile.Exists(RevsCsv);
   if not Result then Exit;
 
+  // The dates in these files were converted to UTC with whatever zone was in force when they
+  // were read, so a --tz given now cannot change them. Say so rather than let the log claim
+  // a zone the history was never converted with.
+  if TFile.Exists(TPath.Combine(Dir, 'timezone.txt')) then
+  begin
+    FDatesZone := Trim(TFile.ReadAllText(TPath.Combine(Dir, 'timezone.txt'), TEncoding.UTF8));
+    if not SameText(FDatesZone, TCTimeZoneKey) then
+      raise ETCError.CreateFmt(
+        'The saved metadata in %s has dates converted from "%s", but this run uses "%s".'#13#10#13#10 +
+        'Run with the same time zone, or delete the meta folder (and the repository) to ' +
+        're-read the history in the new one.', [Dir, FDatesZone, TCTimeZoneKey]);
+  end
+  else
+  begin
+    FDatesZone := '';
+    Log(Format('  note: the saved metadata does not record its time zone; its dates are kept ' +
+      'as saved, whatever the zone now (%s). Delete meta\ to re-read them.', [TCTimeZoneName]));
+  end;
+
   Files.Clear;
   Revisions.Clear;
   Labels.Clear;
@@ -1470,6 +1494,11 @@ begin
   finally
     L.Free;
   end;
+  // Which zone the dates above were converted with, checked by LoadCsvs. Not written when
+  // reloaded metadata did not record it: stamping today's zone on it would be a guess.
+  if FDatesZone <> '' then
+    TFile.WriteAllText(TPath.Combine(OutDir, 'timezone.txt'), FDatesZone + sLineBreak,
+      TEncoding.ASCII);
   Log('Metadata written to ' + OutDir);
 end;
 
