@@ -66,12 +66,82 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--tz "<zone>"` | Windows time zone of the **TC server's** clock, e.g. `"Eastern Standard Time"` (`Get-TimeZone -ListAvailable`). TC stores wall-clock time with no zone; omitted, this PC's zone is assumed, and every commit is off by the difference. Dates are converted when the history is first read and saved in `meta\`, which records the zone in `meta\timezone.txt`; a later run with a different zone stops rather than mix the two. To change zone, delete `meta\` and the repository |
 | `--user <name>` | TC login for a non-interactive connect. The password is taken from the `TCPWD` environment variable, which keeps it off the command line; `--pwd` still works but is visible to anything that lists processes |
 | `--log <file>` | Write the on-screen log to this file on exit |
+| `--update` | Bring an already-migrated work folder up to date: add only what TC has that the repository does not. See *Keeping a migrated repository up to date* |
+| `--push` | After a successful run, push the branch (and, with `--tags`, the tags) to the remote |
+| `--remote <name>` | The git remote to check against and push to. Default `origin` |
+| `--state <file>` | The migration's checkpoint file, when it is not `state.txt` in the work folder. Only a first `--update` reads it |
 
-Exit codes: `0` success, `1` stopped, `2` no session, `3` no such project id, `4` failed.
+Exit codes: `0` success, `1` stopped, `2` no session, `3` no such project id, `4` failed,
+`5` refused - the run found something it cannot account for and changed nothing. Retrying
+cannot fix a `5`; the supervisor stops on it.
 
 **Start with `--limit`.** A run over the whole repository is tens of thousands of revisions and one `tc Get`
 each; a 25-file run exercises every phase in a couple of minutes and tells you whether the
 settings, the view and the git output are right before you commit hours to it.
+
+## Keeping a migrated repository up to date
+
+Once a migration has finished and been pushed, `--update` adds the check-ins made in Team
+Coherence since, as ordinary commits on top of the published branch. Run it from the **same
+work folder** as the migration: its `meta\` and blob cache are how it knows what is already in
+git.
+
+One-time setup, in the repository the migration created:
+
+```
+git -C D:\migration\repo.git remote add origin <url>
+```
+
+Then, as often as you like:
+
+```powershell
+$env:TCPWD = 'your-tc-password'
+.\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push
+```
+
+The push runs with no terminal, so git must be able to authenticate unattended - an SSH key, or
+a credential already stored by Git Credential Manager. A prompt is never shown; the push fails
+instead, and the supervisor retries.
+
+What an update does:
+
+1. **Works out what is already in git** - exactly, not by date. The first update takes it from
+   the migration's checkpoint; every update after keeps a ledger, `meta\imported.csv`. A
+   history rewritten since the migration - re-dated, say - has different commit hashes but
+   the same content, and is accepted on the strength of step 3.
+2. **Checks the branch against the remote.** The update builds only on the published tip. If
+   the remote has a commit this repository does not, it refuses (exit `5`): the mirror is meant
+   to be written only by tc2git.
+3. **Verifies the tip's content.** Every path in the branch tip must hold exactly the bytes of
+   the TC revision the record says it does, and nothing else may be there. Any difference is
+   listed in `meta\update_mismatch.csv` and the update refuses rather than build on it.
+4. **Re-reads Team Coherence** in full, including label assignments - though a labelled
+   revision whose label count has not changed keeps its earlier answer, so only the rest are
+   asked.
+5. **Follows moves and renames** as one commit, with the content each file already had.
+6. **Adds the new check-ins**, grouped as in a migration, in batches with the ledger
+   checkpointed after each. A revision that would write content a path already holds is left
+   out. A revision older than one of the same file already in git is not added - it would put
+   old content over new - and is listed in `meta\update_behind.csv`.
+7. **Rebuilds the tags.** A label re-applied in TC moves its tag; a label deleted in TC leaves
+   its tag, which is listed in the log for a person to decide about.
+8. **Removes deleted files**, by the same trusted-listing check as a migration, and only those
+   still at the tip - so an update with nothing deleted adds no commit for it.
+9. **Pushes**, with `--push`: the branch as a fast-forward, never forced; the tags forced, since
+   a moved label must move its tag on the remote too.
+
+An update interrupted at any point continues on the next run: commits not yet recorded in
+`update.txt` are discarded and redone once. Nothing is pushed until a run has finished and
+verified.
+
+What it cannot do:
+
+- **Commits made directly in git.** The mirror is one-way. A commit pushed to the branch by
+  anyone else makes every later update refuse until it is removed.
+- **Without the work folder.** A new machine needs a copy of the whole work folder, not just
+  the repository.
+- **Move dates.** TC records none, so moves and deletions are committed when the update runs,
+  not when they happened.
 
 ## How long it takes, and why
 

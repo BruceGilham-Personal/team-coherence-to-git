@@ -44,6 +44,24 @@ type
     // 2.6 s per revision, and byte-identical output. Calls are serialised inside the session,
     // so this pins the fetcher to one worker.
     UseDll: Boolean;
+    // Bring an already-migrated repository up to date instead of migrating from scratch:
+    // re-read Team Coherence and add only what is not yet in git (see BeginUpdate).
+    UpdateMode: Boolean;
+    Remote: string;       // git remote the repository mirrors to, e.g. 'origin'
+    Push: Boolean;        // push the branch and tags to Remote after a successful run
+    // The migration's checkpoint file; '' = state.txt in WorkDir. A first update reads it to
+    // learn what the migration put in git.
+    StateFile: string;
+  end;
+
+  // A state that needs a person to look at it, not a retry: the supervisor stops on it.
+  EUpdateRefused = class(Exception);
+
+  // Update mode's record of one path in the branch tip: which archive wrote it, and with what.
+  TTreeEntry = record
+    FileID: Cardinal;
+    Member: string;
+    Sha: string;           // sha256, as in blobs.csv
   end;
 
   TPipeline = class
@@ -82,6 +100,27 @@ type
     FRunStarted: TDateTime;
     FStartedAt: Integer;
     FLastOut: string;
+    // ---- update mode ------------------------------------------------------------------
+    FLedger: TDictionary<string, Boolean>;     // 'fileid|revision' already handled
+    FLedgerNew: TStringList;                   // handled since the last update checkpoint
+    FLedgerRows: Integer;                      // rows of imported.csv the checkpoint vouches for
+    FTree: TDictionary<string, TTreeEntry>;    // the branch tip's tree, path -> provenance
+    FOldFiles: TArray<TTCFile>;                // metadata as the previous run saved it
+    FOldRevs: TArray<TTCRevision>;
+    FOldAttach: TArray<TTCAttachment>;
+    function GitOut(const Args: string; out Output: string; TimeoutSec: Integer = 300): Integer;
+    function RefSha(const Ref: string): string;
+    function IsAncestor(const A, B: string): Boolean;
+    function RemoteExists: Boolean;
+    function TipPaths(const Rev: string = ''): TDictionary<string, string>;
+    function GitBlobIds(const Shas: TArray<string>): TDictionary<string, string>;
+    function UpdateStatePath: string;
+    procedure SortChronologically(var Revs: TArray<TTCRevision>);
+    function SameCheckIn(const A, B: TTCRevision): Boolean;
+    procedure BuildFirstLedger(out Tip: string);
+    procedure LoadUpdateState(out Tip: string);
+    procedure SaveUpdateCheckpoint;
+    procedure VerifyTree(const Tip: string; Prune: Boolean);
     function StatePath: string;
     function TestConnection: Boolean;
     function ReadCheckpoint: Integer;
@@ -97,10 +136,12 @@ type
     function PendingCount: Integer;
     procedure ReleaseFile(FileID: Cardinal);
     procedure AppendManifest(const Rows: TArray<string>);
+    procedure AppendRows(const Name, Header: string; const Rows: TArray<string>);
     procedure AppendSkipped(const Rows: TArray<string>);
     procedure MergeSaveCsv(const Name, Header: string; Rows: TStrings);
     procedure ImportRange(StartIdx, EndIdx: Integer);
-    function StartFastImport(out ProcInfo: TProcessInformation; out StdInWrite: THandle): Boolean;
+    function StartFastImport(out ProcInfo: TProcessInformation; out StdInWrite: THandle;
+      Force: Boolean = False): Boolean;
     function FinishFastImport(var ProcInfo: TProcessInformation; var StdInWrite: THandle;
       out Output: string): Integer;
     procedure FetchOne(Index: Integer);
@@ -140,6 +181,12 @@ type
     procedure RemoveDeletedFiles;
     procedure Verify;
     procedure VerifySizes;
+    // update mode, in the order the worker calls them
+    procedure BeginUpdate;
+    procedure PrepareLabelCarryOver;
+    procedure FollowMovedFiles;
+    procedure RunUpdate;
+    procedure PushToRemote;
     property Blobs: TList<TBlob> read FBlobs;
   end;
 
@@ -164,10 +211,16 @@ begin
   FInFlight := TDictionary<Cardinal, Boolean>.Create;
   FPending := TList<Integer>.Create;
   FFailedRows := TStringList.Create;
+  FLedger := TDictionary<string, Boolean>.Create;
+  FLedgerNew := TStringList.Create;
+  FTree := TDictionary<string, TTreeEntry>.Create;
 end;
 
 destructor TPipeline.Destroy;
 begin
+  FLedger.Free;
+  FLedgerNew.Free;
+  FTree.Free;
   FBlobs.Free;
   FAuthors.Free;
   FLock.Free;
@@ -855,7 +908,7 @@ begin
 end;
 
 function TPipeline.StartFastImport(out ProcInfo: TProcessInformation;
-  out StdInWrite: THandle): Boolean;
+  out StdInWrite: THandle; Force: Boolean): Boolean;
 // Starts git fast-import reading from a pipe instead of a file.
 //
 // The stream carries every blob inline, so staging it on disk costs as much space again as
@@ -894,7 +947,10 @@ begin
   SI.hStdOutput := OutWrite;
   SI.hStdError := OutWrite;
 
-  Cmd := Format('"%s" fast-import --quiet --max-pack-size=1g', [FOpt.GitExe]);
+  // --force lets a ref move to a commit that does not descend from it: a label re-applied in
+  // TC rebuilds its tag as a new root commit, which fast-import otherwise refuses.
+  Cmd := Format('"%s" fast-import --quiet --max-pack-size=1g%s',
+    [FOpt.GitExe, IfThen(Force, ' --force', '')]);
   Result := CreateProcess(nil, PChar(Cmd), nil, nil, True, CREATE_NO_WINDOW,
                           nil, PChar(FOpt.RepoDir), SI, ProcInfo);
 
@@ -1195,6 +1251,7 @@ end;
 
 function TPipeline.StatePath: string;
 begin
+  if FOpt.StateFile <> '' then Exit(FOpt.StateFile);
   Result := TPath.Combine(FOpt.WorkDir, 'state.txt');
 end;
 
@@ -1472,37 +1529,15 @@ begin
   end;
 end;
 
-procedure TPipeline.AppendSkipped(const Rows: TArray<string>);
-var
-  F: TStreamWriter;
-  Path: string;
-  IsNew: Boolean;
-begin
-  if Length(Rows) = 0 then Exit;
-  Path := TPath.Combine(FOpt.MetaDir, 'skipped.csv');
-  IsNew := not TFile.Exists(Path);
-  if IsNew then
-    F := TStreamWriter.Create(TFileStream.Create(Path, fmCreate or fmShareDenyWrite), TEncoding.UTF8)
-  else
-    F := TStreamWriter.Create(TFileStream.Create(Path, fmOpenWrite or fmShareDenyWrite), TEncoding.UTF8);
-  try
-    F.OwnStream;
-    if IsNew then F.WriteLine('file_id,tc_path,revision,reason')
-    else F.BaseStream.Seek(0, soEnd);
-    for Path in Rows do F.WriteLine(Path);
-  finally
-    F.Free;
-  end;
-end;
-
-procedure TPipeline.AppendManifest(const Rows: TArray<string>);
+procedure TPipeline.AppendRows(const Name, Header: string; const Rows: TArray<string>);
+// Appends rows to a metadata CSV, creating it with its header if it does not exist yet.
 var
   F: TStreamWriter;
   Path, S: string;
   IsNew: Boolean;
 begin
   if Length(Rows) = 0 then Exit;
-  Path := TPath.Combine(FOpt.MetaDir, 'blobs.csv');
+  Path := TPath.Combine(FOpt.MetaDir, Name);
   IsNew := not TFile.Exists(Path);
   if IsNew then
     F := TStreamWriter.Create(TFileStream.Create(Path, fmCreate or fmShareDenyWrite),
@@ -1512,12 +1547,55 @@ begin
                               TEncoding.UTF8);
   try
     F.OwnStream;
-    if IsNew then F.WriteLine('file_id,revision,member,sha256,size,cache_path')
+    if IsNew then F.WriteLine(Header)
     else F.BaseStream.Seek(0, soEnd);
     for S in Rows do F.WriteLine(S);
   finally
     F.Free;
   end;
+end;
+
+procedure TPipeline.AppendSkipped(const Rows: TArray<string>);
+begin
+  AppendRows('skipped.csv', 'file_id,tc_path,revision,reason', Rows);
+end;
+
+procedure TPipeline.AppendManifest(const Rows: TArray<string>);
+begin
+  AppendRows('blobs.csv', 'file_id,revision,member,sha256,size,cache_path', Rows);
+end;
+
+procedure TPipeline.SortChronologically(var Revs: TArray<TTCRevision>);
+// Oldest first, with ties broken by path and revision so the order is the same on every run:
+// update mode relies on that to know what a previous run already imported.
+begin
+  TArray.Sort<TTCRevision>(Revs, TComparer<TTCRevision>.Construct(
+    function(const A, B: TTCRevision): Integer
+    begin
+      Result := CompareDateTime(A.When, B.When);
+      if Result = 0 then Result := CompareStr(A.TCPath, B.TCPath);
+      if Result = 0 then Result := CompareStr(A.Revision, B.Revision);
+    end));
+end;
+
+function TPipeline.SameCheckIn(const A, B: TTCRevision): Boolean;
+// Team Coherence records no changeset, so a check-in is reconstructed from contiguous
+// revisions by one author sharing one comment. Contiguity is what makes that safe: an
+// exclusive-lock VCS means two people cannot touch the same file at once, and every human
+// check-in here carries a comment (all 14,292 blank ones belong to "build").
+//
+// WindowSeconds = 0 means no time limit, which is the accurate choice: a genuine check-in can
+// take hours to upload - one here spans 16 hours and 652 files - and a 180-second cap
+// shattered 2,620 real check-ins into fragments.
+//
+// This is only used to avoid cutting a batch through the middle of a group. The authoritative
+// commit boundary is in ImportRange, which ALSO splits when a file repeats inside a group;
+// groups there are therefore never larger than what this predicts, so extending a batch by
+// this rule stays conservative.
+begin
+  Result := (A.Author = B.Author) and (A.Comment = B.Comment) and
+            ((FOpt.WindowSeconds <= 0) or
+             (SecondsBetween(A.When, B.When) <= FOpt.WindowSeconds));
 end;
 
 procedure TPipeline.RunIncremental;
@@ -1526,27 +1604,6 @@ var
   Total, Idx, BatchEnd, Done, BatchNo, FetchWindow: Integer;
   StartedAt: TDateTime;
   Secs: Double;
-
-  function SameGroup(const A, B: TTCRevision): Boolean;
-  begin
-    // Team Coherence records no changeset, so a check-in is reconstructed from contiguous
-    // revisions by one author sharing one comment. Contiguity is what makes that safe: an
-    // exclusive-lock VCS means two people cannot touch the same file at once, and every
-    // human check-in here carries a comment (all 14,292 blank ones belong to "build").
-    //
-    // WindowSeconds = 0 means no time limit, which is the accurate choice: a genuine
-    // check-in can take hours to upload - one here spans 16 hours and 652 files - and a
-    // 180-second cap shattered 2,620 real check-ins into fragments.
-    //
-    // This is only used to avoid cutting a batch through the middle of a group. The
-    // authoritative commit boundary is in ImportRange, which ALSO splits when a file repeats
-    // inside a group; groups there are therefore never larger than what this predicts, so
-    // extending a batch by this rule stays conservative.
-    Result := (A.Author = B.Author) and (A.Comment = B.Comment) and
-              ((FOpt.WindowSeconds <= 0) or
-               (SecondsBetween(A.When, B.When) <= FOpt.WindowSeconds));
-  end;
-
 begin
   if not TestConnection then
     raise Exception.Create(
@@ -1562,13 +1619,7 @@ begin
 
   // oldest first: the history is replayed forward, exactly as it happened
   Revs := FSession.Revisions.ToArray;
-  TArray.Sort<TTCRevision>(Revs, TComparer<TTCRevision>.Construct(
-    function(const A, B: TTCRevision): Integer
-    begin
-      Result := CompareDateTime(A.When, B.When);
-      if Result = 0 then Result := CompareStr(A.TCPath, B.TCPath);
-      if Result = 0 then Result := CompareStr(A.Revision, B.Revision);
-    end));
+  SortChronologically(Revs);
   Total := Length(Revs);
   if Total = 0 then Exit;
 
@@ -1608,7 +1659,7 @@ begin
     BatchEnd := Idx + FOpt.BatchSize;
     if BatchEnd > Total then BatchEnd := Total;
     // never cut a changeset in half: extend to the end of the group in flight
-    while (BatchEnd < Total) and SameGroup(Revs[BatchEnd - 1], Revs[BatchEnd]) do
+    while (BatchEnd < Total) and SameCheckIn(Revs[BatchEnd - 1], Revs[BatchEnd]) do
       Inc(BatchEnd);
 
     Item(Format('batch %d: check-ins %d-%d of %d', [BatchNo, Idx + 1, BatchEnd, Total]));
@@ -1727,14 +1778,26 @@ var
   var
     N: Integer;
     Lst: TList<Integer>;
+    Was, Entry: TTreeEntry;
   begin
     if not Index.TryGetValue(Format('%d|%s', [Rev.FileID, Rev.Revision]), Lst) then Exit;
     for N in Lst do
     begin
-      if not EmitBlob(FS, FBlobs[N], Marks, Mark) then Continue;
       Chg.Path := MemberPath(Rev.TCPath, FBlobs[N].Member);
       Chg.Sha := FBlobs[N].Sha;
+      // Update mode tracks the tip's tree, so a revision that would write the content a path
+      // already holds is left out: a check-in made of nothing but those makes no commit.
+      if FOpt.UpdateMode and FTree.TryGetValue(Chg.Path, Was) and (Was.Sha = Chg.Sha) then
+        Continue;
+      if not EmitBlob(FS, FBlobs[N], Marks, Mark) then Continue;
       Pending.Add(Chg);
+      if FOpt.UpdateMode then
+      begin
+        Entry.FileID := Rev.FileID;
+        Entry.Member := FBlobs[N].Member;
+        Entry.Sha := Chg.Sha;
+        FTree.AddOrSetValue(Chg.Path, Entry);
+      end;
     end;
   end;
 
@@ -1920,8 +1983,10 @@ begin
     Log(Format('Rebuilding %d label(s) from %d attachment(s)...',
       [FSession.Labels.Count, FSession.Attachments.Count]));
 
+    // Forced: these refs belong to this tool, and an unchanged label rebuilds the identical
+    // commit anyway. Only a label re-applied in TC actually moves its tag.
     GitIn := 0;
-    if not StartFastImport(GitProc, GitIn) then
+    if not StartFastImport(GitProc, GitIn, True) then
       raise Exception.Create('Could not start git fast-import for the labels.');
     FS := THandleStream.Create(GitIn);
     try
@@ -2006,6 +2071,18 @@ begin
     end;
     Log(Format('%d label(s) written as tags under refs/tags/. List them with: git tag',
       [TagCount]));
+
+    // A label deleted in TC leaves its tag behind. Deleting a published tag is a decision for
+    // a person, so they are listed rather than removed.
+    if GitOut('for-each-ref --format=%(refname) refs/tags/', Out1) = 0 then
+    begin
+      Paths.Clear;
+      for Key in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+        if not UsedRefs.ContainsKey(LowerCase(Trim(Key))) then Paths.Add(Trim(Key));
+      if (Paths.Count > 0) and not Cancelled then
+        Log(Format('  %d tag(s) no longer match any TC version label and were left in place: %s',
+          [Paths.Count, string.Join(', ', Paths.ToStringArray)]));
+    end;
   finally
     Paths.Free;
     UsedRefs.Free;
@@ -2046,6 +2123,8 @@ var
   GitIn: THandle;
   FS: TStream;
   Gone, Unchecked: TStringList;
+  Cands: TArray<TTCFile>;
+  AtTip: TDictionary<string, string>;
 
   procedure Put(const S: string);
   begin
@@ -2062,10 +2141,25 @@ begin
   Gone := TStringList.Create;
   Unchecked := TStringList.Create;
   try
-    // every distinct folder that holds a migrated file
-    for I := 0 to FSession.Files.Count - 1 do
+    // The files to check. In update mode that includes files the previous run knew and TC no
+    // longer enumerates - the likeliest deletions of all - checked at their old paths.
+    // Absence from the enumeration alone is not trusted: an enumeration cut short by the
+    // network, or a run over fewer projects, would look exactly like a mass deletion.
+    Cands := FSession.Files.ToArray;
+    if FOpt.UpdateMode then
     begin
-      FolderPath := FSession.Files[I].TCPath;
+      for I := 0 to High(Cands) do
+        Live.AddOrSetValue(Cands[I].ID, Cands[I].TCPath);
+      for I := 0 to High(FOldFiles) do
+        if not Live.ContainsKey(FOldFiles[I].ID) then
+          Cands := Cands + [FOldFiles[I]];
+      Live.Clear;
+    end;
+
+    // every distinct folder that holds a migrated file
+    for I := 0 to High(Cands) do
+    begin
+      FolderPath := Cands[I].TCPath;
       J := LastDelimiter('/', FolderPath);
       if J > 0 then FolderPath := Copy(FolderPath, 1, J - 1);
       if not ByFolder.TryGetValue(LowerCase(FolderPath), Lst) then
@@ -2106,15 +2200,15 @@ begin
           end;
           Seen := 0;
           for J in Lst do
-            if Present.ContainsKey(LowerCase(FSession.Files[J].TCPath)) then Inc(Seen);
+            if Present.ContainsKey(LowerCase(Cands[J].TCPath)) then Inc(Seen);
           if Seen = 0 then
             Why := 'the listing names none of its known files'
           else
             for J in Lst do
-              if not Present.ContainsKey(LowerCase(FSession.Files[J].TCPath)) then
+              if not Present.ContainsKey(LowerCase(Cands[J].TCPath)) then
               begin
-                Gone.Add(FSession.Files[J].TCPath);
-                GoneIds.AddOrSetValue(FSession.Files[J].ID, FSession.Files[J].TCPath);
+                Gone.Add(Cands[J].TCPath);
+                GoneIds.AddOrSetValue(Cands[J].ID, Cands[J].TCPath);
               end;
         end;
       end;
@@ -2152,15 +2246,34 @@ begin
         DelPaths.Add(MemberPath(TCPath, FBlobs[J].Member));
     // ...except any path an archive that still exists also writes: deleting it would remove
     // live content from the tip.
-    for I := 0 to FSession.Files.Count - 1 do
-      if not GoneIds.ContainsKey(FSession.Files[I].ID) then
-        Live.AddOrSetValue(FSession.Files[I].ID, FSession.Files[I].TCPath);
+    for I := 0 to High(Cands) do
+      if not GoneIds.ContainsKey(Cands[I].ID) then
+        Live.AddOrSetValue(Cands[I].ID, Cands[I].TCPath);
     for J := 0 to FBlobs.Count - 1 do
       if Live.TryGetValue(FBlobs[J].FileID, TCPath) then
       begin
         Rc := DelPaths.IndexOf(MemberPath(TCPath, FBlobs[J].Member));
         if Rc >= 0 then DelPaths.Delete(Rc);
       end;
+    // Update mode knows exactly which paths at the tip each archive wrote, wherever it was.
+    if FOpt.UpdateMode then
+      for TCPath in FTree.Keys do
+        if GoneIds.ContainsKey(FTree[TCPath].FileID) then DelPaths.Add(TCPath);
+
+    // Only what is still at the tip. Every run used to add another deletion commit naming
+    // files an earlier one had already removed - fast-import does not skip an empty commit.
+    AtTip := TipPaths;
+    try
+      for I := DelPaths.Count - 1 downto 0 do
+        if not AtTip.ContainsKey(DelPaths[I]) then DelPaths.Delete(I);
+    finally
+      AtTip.Free;
+    end;
+    if DelPaths.Count = 0 then
+    begin
+      Log('  ...all of them were already removed from the tip by an earlier run.');
+      Exit;
+    end;
 
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn) then
@@ -2170,11 +2283,11 @@ begin
       Put('commit refs/heads/' + FOpt.Branch);
       Put(Format('committer %s %s',
         [MapAuthor('tc'), GitStamp(NowUtc)]));
-      Line := Format('Remove %d files deleted in Team Coherence' + #10 + #10 +
+      Line := Format('Remove %d path(s) of files deleted in Team Coherence' + #10 + #10 +
         'These files no longer exist in the Team Coherence repository. TC records no ' +
         'deletion event that can be dated, so they are removed here in a single commit ' +
         'rather than at the point each was actually deleted. See meta/deleted.csv.',
-        [Gone.Count]);
+        [DelPaths.Count]);
       Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Line))));
       Put(Line);
       Put('from refs/heads/' + FOpt.Branch + '^0');
@@ -2189,6 +2302,12 @@ begin
       raise Exception.Create('git fast-import failed on the deletion commit.');
     end;
     Log(Format('Removed %d path(s) at the tip.', [DelPaths.Count]));
+    if FOpt.UpdateMode then
+    begin
+      for I := 0 to DelPaths.Count - 1 do
+        FTree.Remove(DelPaths[I]);
+      SaveUpdateCheckpoint;
+    end;
   finally
     Present.Free;
     ByFolder.Free;
@@ -2199,6 +2318,799 @@ begin
     Gone.Free;
     Unchecked.Free;
   end;
+end;
+
+// ---------------------------------------------------------------- update mode
+//
+// Brings a repository that has already been migrated - and pushed - up to date with the
+// check-ins made in Team Coherence since, as a fast-forward on top of what is published.
+//
+// What is already in git is known exactly rather than inferred. The first update takes it from
+// the original migration's own checkpoint: the first N revisions of the order that run saved.
+// Every update after that keeps a ledger of what it handled. That record is then CHECKED, not
+// trusted: every path in the branch tip must hold exactly the bytes of the TC revision the
+// record says it does, or the update stops before changing anything. And the tip must be the
+// one on the remote, so an update only ever builds on the published history.
+//
+// Matching by commit date instead would not work. A commit is dated by the FIRST revision of
+// its check-in, which can span hours, and the deletion commit is dated when its run ended - so
+// "everything after the tip's date" both skips and repeats revisions at the boundary.
+//
+// State, written together at every checkpoint (SaveUpdateCheckpoint):
+//   meta\imported.csv     every (file, revision) handled: imported, empty, or given up
+//   meta\tree.<sha>.csv   the tip's tree with provenance: path, file id, member, sha256
+//   update.txt            the tip those describe, and how many ledger rows they cover
+
+function TPipeline.GitOut(const Args: string; out Output: string; TimeoutSec: Integer): Integer;
+begin
+  Result := RunProcess(FOpt.GitExe, Args, FOpt.RepoDir, Output, '', True, TimeoutSec);
+end;
+
+function TPipeline.RefSha(const Ref: string): string;
+begin
+  if GitOut('rev-parse --verify --quiet ' + Ref + '^{commit}', Result) <> 0 then Result := '';
+  Result := Trim(Result);
+end;
+
+function TPipeline.IsAncestor(const A, B: string): Boolean;
+var
+  Out1: string;
+begin
+  Result := GitOut(Format('merge-base --is-ancestor %s %s', [A, B]), Out1) = 0;
+end;
+
+function TPipeline.RemoteExists: Boolean;
+var
+  Out1: string;
+begin
+  Result := (FOpt.Remote <> '') and (GitOut('remote get-url ' + FOpt.Remote, Out1) = 0);
+end;
+
+function TPipeline.TipPaths(const Rev: string): TDictionary<string, string>;
+// path -> git blob id of every file in Rev (the branch tip when empty); empty when there is no
+// branch yet.
+var
+  Out1, Rec, Commit: string;
+  Tab: Integer;
+  Hdr: TArray<string>;
+begin
+  Result := TDictionary<string, string>.Create;
+  try
+    Commit := Rev;
+    if Commit = '' then Commit := RefSha('refs/heads/' + FOpt.Branch);
+    if Commit = '' then Exit;
+    if GitOut('ls-tree -r -z --full-tree ' + Commit, Out1) <> 0 then
+      raise Exception.Create('git ls-tree failed: ' + Copy(Trim(Out1), 1, 300));
+    // NUL-separated, so no path is ever quoted or escaped: <mode> <type> <id> TAB <path>
+    for Rec in Out1.Split([#0], TStringSplitOptions.ExcludeEmpty) do
+    begin
+      Tab := Pos(#9, Rec);
+      if Tab = 0 then Continue;
+      Hdr := Copy(Rec, 1, Tab - 1).Split([' ']);
+      if (Length(Hdr) = 3) and (Hdr[1] = 'blob') then
+        Result.AddOrSetValue(Copy(Rec, Tab + 1, MaxInt), Hdr[2]);
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TPipeline.GitBlobIds(const Shas: TArray<string>): TDictionary<string, string>;
+// sha256, the cache's name for a blob -> the id git gives the same bytes, so the cache can be
+// compared with a tree. git hashes the cached files itself; --no-filters keeps line-ending
+// conversion out of it, exactly as fast-import does. A blob missing from the cache gets no id.
+var
+  ListFile, Out1, F: string;
+  L: TStringList;
+  Present: TList<string>;
+  Ids: TArray<string>;
+  Sha: string;
+  I: Integer;
+begin
+  Result := TDictionary<string, string>.Create;
+  Present := TList<string>.Create;
+  L := TStringList.Create;
+  try
+    try
+      for Sha in Shas do
+      begin
+        F := TPath.Combine(TPath.Combine(FOpt.CacheDir, Copy(Sha, 1, 2)), Sha);
+        if not TFile.Exists(F) then Continue;
+        Present.Add(Sha);
+        L.Add(F);
+      end;
+      if Present.Count = 0 then Exit;
+      ListFile := TPath.Combine(FOpt.WorkDir, 'hash-paths.txt');
+      L.WriteBOM := False;
+      L.SaveToFile(ListFile, TEncoding.UTF8);
+      try
+        if RunProcess(FOpt.GitExe, 'hash-object --no-filters --stdin-paths', FOpt.RepoDir,
+                      Out1, ListFile, True, 3600) <> 0 then
+          raise Exception.Create('git hash-object failed: ' + Copy(Trim(Out1), 1, 300));
+      finally
+        TFile.Delete(ListFile);
+      end;
+      Ids := Out1.Split([#10], TStringSplitOptions.ExcludeEmpty);
+      if Length(Ids) <> Present.Count then
+        raise Exception.CreateFmt('git hash-object returned %d ids for %d files',
+          [Length(Ids), Present.Count]);
+      for I := 0 to Present.Count - 1 do
+        Result.AddOrSetValue(Present[I], Trim(Ids[I]));
+    except
+      Result.Free;
+      raise;
+    end;
+  finally
+    L.Free;
+    Present.Free;
+  end;
+end;
+
+function TPipeline.UpdateStatePath: string;
+begin
+  Result := TPath.Combine(FOpt.WorkDir, 'update.txt');
+end;
+
+procedure TPipeline.BuildFirstLedger(out Tip: string);
+// The first update: what the original migration put in git is the first N revisions of the
+// order it saved, N being its checkpoint. Revisions it could not fetch or found empty are in
+// that range too, and count as handled - the same as they did then.
+var
+  L: TStringList;
+  Old: TArray<TTCRevision>;
+  Index: TObjectDictionary<string, TList<Integer>>;
+  Lst: TList<Integer>;
+  Idx, I, N: Integer;
+  StateTip, Key: string;
+  E: TTreeEntry;
+begin
+  if not TFile.Exists(StatePath) then
+    raise EUpdateRefused.CreateFmt('There is no migration checkpoint at %s, so there is no ' +
+      'migration here to update. Run a full migration first, or name the checkpoint file ' +
+      'with --state.', [StatePath]);
+  Idx := ReadCheckpoint;
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(StatePath);
+    StateTip := Trim(L.Values['tip']);
+  finally
+    L.Free;
+  end;
+
+  Old := FSession.Revisions.ToArray;   // as the migration saved them
+  SortChronologically(Old);
+  if (Idx <= 0) or (Idx > Length(Old)) then
+    raise EUpdateRefused.CreateFmt('state.txt records %d check-ins but the saved metadata ' +
+      'has %d revisions, so what was migrated cannot be worked out.', [Idx, Length(Old)]);
+  if Idx < Length(Old) then
+    Log(Format('  note: the migration stopped at %d of %d revisions; the rest are added now.',
+      [Idx, Length(Old)]));
+
+  Tip := RefSha('refs/heads/' + FOpt.Branch);
+  if Tip = '' then
+    raise EUpdateRefused.CreateFmt('The repository has no branch %s.', [FOpt.Branch]);
+  // Not a refusal: a history re-dated after the migration (fast-export, rewrite, fast-import)
+  // has every commit hash changed and the same content. Whether this IS the migration's
+  // history is settled by VerifyTree, which checks every file's bytes - a stronger test than
+  // any hash, and one a re-dating does not disturb.
+  if (StateTip <> '') and not IsAncestor(StateTip, Tip) then
+    Log(Format('  note: branch %s does not contain %s, the commit the migration recorded - ' +
+      'its history has been rewritten since (e.g. re-dated). The content check decides.',
+      [FOpt.Branch, Copy(StateTip, 1, 8)]));
+
+  Index := BlobIndex;
+  try
+    for I := 0 to Idx - 1 do
+    begin
+      Key := Format('%d|%s', [Old[I].FileID, Old[I].Revision]);
+      FLedger.AddOrSetValue(Key, True);
+      FLedgerNew.Add(Format('%d,%s', [Old[I].FileID, CsvQ(Old[I].Revision)]));
+      // replayed in the same order ImportRange wrote them, so the last write to a path wins
+      if Index.TryGetValue(Key, Lst) then
+        for N in Lst do
+        begin
+          E.FileID := Old[I].FileID;
+          E.Member := FBlobs[N].Member;
+          E.Sha := FBlobs[N].Sha;
+          FTree.AddOrSetValue(MemberPath(Old[I].TCPath, E.Member), E);
+        end;
+    end;
+  finally
+    Index.Free;
+  end;
+  Log(Format('First update: %d revisions recorded as migrated, from the migration''s ' +
+    'checkpoint.', [Idx]));
+end;
+
+procedure TPipeline.LoadUpdateState(out Tip: string);
+var
+  L: TStringList;
+  C: TArray<string>;
+  Rows, I: Integer;
+  TreeFile, LedgerFile: string;
+  E: TTreeEntry;
+begin
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(UpdateStatePath);
+    Tip := Trim(L.Values['tip']);
+    Rows := StrToIntDef(Trim(L.Values['ledger_rows']), -1);
+    if (Tip = '') or (Rows < 0) then
+      raise EUpdateRefused.Create('update.txt is damaged: it names no tip or no ledger size.');
+
+    // Only the rows the checkpoint vouches for. Any after them were appended by an update
+    // that stopped before its checkpoint; that work is redone, so they are dropped.
+    LedgerFile := TPath.Combine(FOpt.MetaDir, 'imported.csv');
+    if not TFile.Exists(LedgerFile) then
+      raise EUpdateRefused.Create('update.txt exists but meta\imported.csv does not.');
+    L.LoadFromFile(LedgerFile, TEncoding.UTF8);
+    if L.Count - 1 < Rows then
+      raise EUpdateRefused.CreateFmt('meta\imported.csv has %d rows but update.txt records ' +
+        '%d.', [L.Count - 1, Rows]);
+    for I := 1 to Rows do
+    begin
+      C := SplitCsv(L[I]);
+      if Length(C) >= 2 then FLedger.AddOrSetValue(C[0] + '|' + C[1], True);
+    end;
+    if L.Count - 1 > Rows then
+    begin
+      Log(Format('  dropping %d ledger row(s) an interrupted update wrote after its last ' +
+        'checkpoint', [L.Count - 1 - Rows]));
+      while L.Count - 1 > Rows do L.Delete(L.Count - 1);
+      L.WriteBOM := False;
+      L.SaveToFile(LedgerFile, TEncoding.UTF8);
+    end;
+    FLedgerRows := Rows;
+
+    TreeFile := TPath.Combine(FOpt.MetaDir, 'tree.' + Tip + '.csv');
+    if not TFile.Exists(TreeFile) then
+      raise EUpdateRefused.CreateFmt('meta\tree.%s.csv, the record of the last update''s ' +
+        'tree, is missing.', [Tip]);
+    L.LoadFromFile(TreeFile, TEncoding.UTF8);
+    for I := 1 to L.Count - 1 do
+    begin
+      C := SplitCsv(L[I]);
+      if Length(C) < 4 then Continue;
+      E.FileID := StrToUIntDef(C[1], 0);
+      E.Member := C[2];
+      E.Sha := C[3];
+      FTree.AddOrSetValue(C[0], E);
+    end;
+  finally
+    L.Free;
+  end;
+  Log(Format('Last update: %d revisions handled, tip %s, %d paths.',
+    [FLedger.Count, Copy(Tip, 1, 8), FTree.Count]));
+end;
+
+procedure TPipeline.SaveUpdateCheckpoint;
+// Order matters, so that a stop at any point leaves a consistent state: ledger rows first (the
+// row count in update.txt still excludes them), then the tree under the new tip's own name
+// (the old tree file is still there), then update.txt by rename, and only then the old trees.
+var
+  Tip, TreeFile, Tmp, F: string;
+  L: TStringList;
+  P: string;
+  E: TTreeEntry;
+begin
+  Tip := RefSha('refs/heads/' + FOpt.Branch);
+  if Tip = '' then raise Exception.Create('No branch to record an update checkpoint for.');
+
+  if FLedgerNew.Count > 0 then
+  begin
+    AppendRows('imported.csv', 'file_id,revision', FLedgerNew.ToStringArray);
+    Inc(FLedgerRows, FLedgerNew.Count);
+    FLedgerNew.Clear;
+  end;
+
+  L := TStringList.Create;
+  try
+    TreeFile := TPath.Combine(FOpt.MetaDir, 'tree.' + Tip + '.csv');
+    L.Add('path,file_id,member,sha256');
+    for P in FTree.Keys do
+    begin
+      E := FTree[P];
+      L.Add(Format('%s,%d,%s,%s', [CsvQ(P), E.FileID, CsvQ(E.Member), E.Sha]));
+    end;
+    L.WriteBOM := False;
+    L.SaveToFile(TreeFile, TEncoding.UTF8);
+
+    L.Clear;
+    L.Values['tip'] := Tip;
+    L.Values['ledger_rows'] := IntToStr(FLedgerRows);
+    L.Values['branch'] := FOpt.Branch;
+    L.Values['updated'] := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss', Now);
+    Tmp := UpdateStatePath + '.tmp';
+    L.SaveToFile(Tmp);
+    if not MoveFileEx(PChar(Tmp), PChar(UpdateStatePath),
+                      MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+      RaiseLastOSError;
+  finally
+    L.Free;
+  end;
+
+  for F in TDirectory.GetFiles(FOpt.MetaDir, 'tree.*.csv') do
+    if not SameText(F, TreeFile) then TFile.Delete(F);
+end;
+
+procedure TPipeline.VerifyTree(const Tip: string; Prune: Boolean);
+// The check that makes the record trustworthy: every path at Tip must hold exactly the bytes of
+// the TC revision recorded for it, and nothing else may be there.
+//
+// Prune is for the first update only. The migration's deletion commit removed some paths that
+// the replayed record still has; those are dropped from the record rather than counted.
+var
+  AtTip, Ids: TDictionary<string, string>;
+  Shas: TDictionary<string, Boolean>;
+  Rows, Dropped: TStringList;
+  P, Want, Got: string;
+  E: TTreeEntry;
+begin
+  AtTip := TipPaths(Tip);
+  Shas := TDictionary<string, Boolean>.Create;
+  Rows := TStringList.Create;
+  Dropped := TStringList.Create;
+  Ids := nil;
+  try
+    for E in FTree.Values do Shas.AddOrSetValue(E.Sha, True);
+    Ids := GitBlobIds(Shas.Keys.ToArray);
+
+    for P in FTree.Keys do
+    begin
+      E := FTree[P];
+      if not Ids.TryGetValue(E.Sha, Want) then Want := '(not in the blob cache)';
+      if not AtTip.TryGetValue(P, Got) then
+      begin
+        if Prune then Dropped.Add(P)
+        else Rows.Add(Format('%s,%s,(absent)', [CsvQ(P), Want]));
+      end
+      else if Want <> Got then
+        Rows.Add(Format('%s,%s,%s', [CsvQ(P), Want, Got]));
+    end;
+    for P in AtTip.Keys do
+      if not FTree.ContainsKey(P) then
+        Rows.Add(Format('%s,(no Team Coherence revision recorded),%s', [CsvQ(P), AtTip[P]]));
+
+    for P in Dropped do FTree.Remove(P);
+    if Dropped.Count > 0 then
+      Log(Format('  %d path(s) removed by the migration''s deletion commit are no longer ' +
+        'expected at the tip.', [Dropped.Count]));
+
+    if Rows.Count > 0 then
+    begin
+      Rows.Insert(0, 'path,expected_blob,blob_at_tip');
+      Rows.SaveToFile(TPath.Combine(FOpt.MetaDir, 'update_mismatch.csv'), TEncoding.UTF8);
+      raise EUpdateRefused.CreateFmt(
+        '%d path(s) at %s do not hold what the record of the migration says they should; ' +
+        'they are listed in meta\update_mismatch.csv. Nothing was changed. Updating on top ' +
+        'of a tree that does not match Team Coherence would carry the difference forward.',
+        [Rows.Count - 1, Copy(Tip, 1, 8)]);
+    end;
+    Log(Format('Verified: all %d paths at %s hold exactly the Team Coherence content ' +
+      'recorded for them.', [FTree.Count, Copy(Tip, 1, 8)]));
+  finally
+    Ids.Free;
+    Dropped.Free;
+    Rows.Free;
+    Shas.Free;
+    AtTip.Free;
+  end;
+end;
+
+procedure TPipeline.BeginUpdate;
+// Called after the PREVIOUS run's metadata has been loaded and before Team Coherence is read
+// again: works out what is already in git, makes the branch match the remote, and verifies the
+// tip's content. Refuses, changing nothing, when any of that does not add up.
+var
+  Recorded, Local, Remote, Out1: string;
+  First: Boolean;
+begin
+  if not TDirectory.Exists(FOpt.RepoDir) then
+    raise EUpdateRefused.CreateFmt('There is no repository at %s to update.', [FOpt.RepoDir]);
+  // git has no terminal to prompt on here, so a missing credential must fail, not wait.
+  SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0');
+  LoadBlobManifest;
+  FOldFiles := FSession.Files.ToArray;
+  FOldRevs := FSession.Revisions.ToArray;
+  FOldAttach := FSession.Attachments.ToArray;
+
+  First := not TFile.Exists(UpdateStatePath);
+  if First then BuildFirstLedger(Recorded) else LoadUpdateState(Recorded);
+
+  // An update that stopped between an import and its checkpoint leaves commits nothing
+  // vouches for. They are redone, not kept.
+  Local := RefSha('refs/heads/' + FOpt.Branch);
+  if Local = '' then
+    raise EUpdateRefused.CreateFmt('The repository has no branch %s.', [FOpt.Branch]);
+  if Local <> Recorded then
+  begin
+    if not IsAncestor(Recorded, Local) then
+      raise EUpdateRefused.CreateFmt('Branch %s is at %s, which does not contain the last ' +
+        'update''s checkpoint %s. Something other than tc2git changed it.',
+        [FOpt.Branch, Copy(Local, 1, 8), Copy(Recorded, 1, 8)]);
+    Log(Format('Branch is at %s, past the last checkpoint %s: an update stopped before ' +
+      'recording its work. Discarding that so it is redone once.',
+      [Copy(Local, 1, 8), Copy(Recorded, 1, 8)]));
+    if GitOut(Format('update-ref refs/heads/%s %s %s', [FOpt.Branch, Recorded, Local]),
+              Out1) <> 0 then
+      raise Exception.Create('Could not rewind the branch: ' + Trim(Out1));
+  end;
+
+  // The remote holds the published history, and an update builds only on that.
+  if RemoteExists then
+  begin
+    Log(Format('Checking %s on %s...', [FOpt.Branch, FOpt.Remote]));
+    if GitOut(Format('ls-remote --heads %s refs/heads/%s', [FOpt.Remote, FOpt.Branch]),
+              Out1, 600) <> 0 then
+      raise Exception.Create('Could not reach the remote: ' + Copy(Trim(Out1), 1, 300));
+    Remote := '';
+    if Trim(Out1) <> '' then
+    begin
+      if GitOut(Format('fetch --no-tags %s +refs/heads/%s:refs/remotes/%s/%s',
+                [FOpt.Remote, FOpt.Branch, FOpt.Remote, FOpt.Branch]), Out1, 3600) <> 0 then
+        raise Exception.Create('git fetch failed: ' + Copy(Trim(Out1), 1, 300));
+      Remote := RefSha(Format('refs/remotes/%s/%s', [FOpt.Remote, FOpt.Branch]));
+    end;
+    if Remote = '' then
+      Log('  the branch is not on the remote yet; a push will create it.')
+    else if Remote = Recorded then
+      Log(Format('  %s/%s is at %s, the same commit this update starts from.',
+        [FOpt.Remote, FOpt.Branch, Copy(Remote, 1, 8)]))
+    else if IsAncestor(Remote, Recorded) then
+      Log(Format('  %s/%s is at %s, behind this repository - an earlier push did not ' +
+        'finish. The push brings it up to date.', [FOpt.Remote, FOpt.Branch, Copy(Remote, 1, 8)]))
+    else
+      raise EUpdateRefused.CreateFmt('%s/%s is at %s, which this repository does not ' +
+        'contain. The mirror is meant to be written only by tc2git, so a commit was made on ' +
+        'the remote or its history was rewritten. Nothing was changed; resolve that first.',
+        [FOpt.Remote, FOpt.Branch, Copy(Remote, 1, 8)]);
+  end
+  else if FOpt.Push then
+    raise EUpdateRefused.CreateFmt('--push was given but the repository has no remote "%s". ' +
+      'Add it once with: git -C "%s" remote add %s <url>',
+      [FOpt.Remote, FOpt.RepoDir, FOpt.Remote])
+  else
+    Log(Format('No remote "%s" in the repository: this update stays local.', [FOpt.Remote]));
+
+  VerifyTree(Recorded, First);
+  if First then SaveUpdateCheckpoint;
+end;
+
+procedure TPipeline.PrepareLabelCarryOver;
+// The label pass asks TC, one call per labelled revision, which labels each one carries - by
+// far the slowest phase. TC also says HOW MANY each carries (ver_count), so a revision whose
+// count is unchanged since the last run keeps the answer it got then, and only the rest are
+// asked. A label moved from one revision to another changes the count of both, so both are
+// asked again.
+var
+  OldVer: TDictionary<string, Integer>;
+  OldLabels: TObjectDictionary<string, TList<Cardinal>>;
+  Done, Found: TStringList;
+  R: TTCRevision;
+  A: TTCAttachment;
+  Key: string;
+  V, Carried, Asked: Integer;
+  Lst: TList<Cardinal>;
+  LabelID: Cardinal;
+begin
+  OldVer := TDictionary<string, Integer>.Create;
+  OldLabels := TObjectDictionary<string, TList<Cardinal>>.Create([doOwnsValues]);
+  Done := TStringList.Create;
+  Found := TStringList.Create;
+  try
+    for R in FOldRevs do
+      if R.VerCount >= 0 then
+        OldVer.AddOrSetValue(Format('%d|%s', [R.FileID, R.Revision]), R.VerCount);
+    for A in FOldAttach do
+    begin
+      Key := Format('%d|%s', [A.FileID, A.Revision]);
+      if not OldLabels.TryGetValue(Key, Lst) then
+      begin
+        Lst := TList<Cardinal>.Create;
+        OldLabels.Add(Key, Lst);
+      end;
+      Lst.Add(A.LabelID);
+    end;
+
+    // the same files and layout EnumAttachments resumes from
+    Done.Add('file_id,revision');
+    Found.Add('label_id,file_id,revision');
+    Carried := 0;
+    Asked := 0;
+    for R in FSession.Revisions do
+    begin
+      if R.VerCount <= 0 then Continue;
+      Key := Format('%d|%s', [R.FileID, R.Revision]);
+      if OldVer.TryGetValue(Key, V) and (V = R.VerCount) and
+         OldLabels.TryGetValue(Key, Lst) and (Lst.Count = V) then
+      begin
+        Done.Add(Format('%d,%s', [R.FileID, R.Revision]));
+        for LabelID in Lst do
+          Found.Add(Format('%d,%d,%s', [LabelID, R.FileID, R.Revision]));
+        Inc(Carried);
+      end
+      else
+        Inc(Asked);
+    end;
+    Done.WriteBOM := False;
+    Found.WriteBOM := False;
+    Done.SaveToFile(TPath.Combine(FOpt.MetaDir, 'attach_done.csv'), TEncoding.UTF8);
+    Found.SaveToFile(TPath.Combine(FOpt.MetaDir, 'attach_log.csv'), TEncoding.UTF8);
+    if TFile.Exists(TPath.Combine(FOpt.MetaDir, 'label_files.csv')) then
+      TFile.Delete(TPath.Combine(FOpt.MetaDir, 'label_files.csv'));
+    Log(Format('Labels: %d labelled revision(s) unchanged since the last run keep their ' +
+      'labels; %d will be asked.', [Carried, Asked]));
+  finally
+    Found.Free;
+    Done.Free;
+    OldLabels.Free;
+    OldVer.Free;
+  end;
+end;
+
+procedure TPipeline.FollowMovedFiles;
+// A file moved or renamed in TC keeps its id and changes path. Its next revision would be
+// written at the new path while the old path stayed, and a file moved with no new revision
+// would never appear at the new path at all. So moves are applied first, as their own commit,
+// with the content the file already has in git.
+var
+  NewPath: TDictionary<Cardinal, string>;
+  BySha: TDictionary<string, Integer>;
+  Marks: TDictionary<string, Integer>;
+  Moves: TList<TPair<string, string>>;
+  Move: TPair<string, string>;
+  Tail: TStringList;
+  P, NP, TCPath, Msg, Out1: string;
+  E: TTreeEntry;
+  I, Mark, Idx: Integer;
+  GitProc: TProcessInformation;
+  GitIn: THandle;
+  FS: TStream;
+begin
+  NewPath := TDictionary<Cardinal, string>.Create;
+  BySha := TDictionary<string, Integer>.Create;
+  Marks := TDictionary<string, Integer>.Create;
+  Moves := TList<TPair<string, string>>.Create;
+  Tail := TStringList.Create;
+  try
+    for I := 0 to FSession.Files.Count - 1 do
+      NewPath.AddOrSetValue(FSession.Files[I].ID, FSession.Files[I].TCPath);
+    for P in FTree.Keys do
+    begin
+      E := FTree[P];
+      if not NewPath.TryGetValue(E.FileID, TCPath) then Continue;   // gone: not a move
+      NP := MemberPath(TCPath, E.Member);
+      if NP <> P then Moves.Add(TPair<string, string>.Create(P, NP));
+    end;
+    if Moves.Count = 0 then
+    begin
+      Log('No files moved or renamed in Team Coherence.');
+      Exit;
+    end;
+
+    for I := 0 to FBlobs.Count - 1 do
+      if not BySha.ContainsKey(FBlobs[I].Sha) then BySha.Add(FBlobs[I].Sha, I);
+
+    GitIn := 0;
+    if not StartFastImport(GitProc, GitIn) then
+      raise Exception.Create('Could not start git fast-import for the moves.');
+    FS := THandleStream.Create(GitIn);
+    try
+      // blobs before the commit: fast-import takes no blob inside a commit's file list
+      Mark := 0;
+      for I := Moves.Count - 1 downto 0 do
+      begin
+        E := FTree[Moves[I].Key];
+        if not BySha.TryGetValue(E.Sha, Idx) or not EmitBlob(FS, FBlobs[Idx], Marks, Mark) then
+        begin
+          Log(Format('  cannot move %s: its content is not in the blob cache; left in place',
+            [Moves[I].Key]));
+          Moves.Delete(I);
+        end;
+      end;
+      if Moves.Count > 0 then
+      begin
+        PutLine(FS, 'commit refs/heads/' + FOpt.Branch);
+        PutLine(FS, Format('committer %s %s',
+          [MapAuthor('tc'), GitStamp(NowUtc)]));
+        Msg := Format('Follow %d path(s) moved or renamed in Team Coherence' + #10 + #10 +
+          'Team Coherence records no date for a move, so the files move here, with the ' +
+          'content they already had, before the check-ins that follow.', [Moves.Count]);
+        PutLine(FS, 'data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
+        PutLine(FS, Msg);
+        PutLine(FS, 'from refs/heads/' + FOpt.Branch + '^0');
+        // every D before any M, so a move onto a path another move vacates is not undone
+        for Move in Moves do PutLine(FS, 'D ' + Move.Key);
+        for Move in Moves do
+          PutLine(FS, Format('M 100644 :%d %s', [Marks[FTree[Move.Key].Sha], Move.Value]));
+      end;
+    finally
+      FS.Free;
+    end;
+    if FinishFastImport(GitProc, GitIn, Out1) <> 0 then
+    begin
+      Log('git fast-import FAILED on the moves:');
+      Log(Out1);
+      raise Exception.Create('git fast-import failed while applying moves.');
+    end;
+    if Moves.Count = 0 then Exit;
+
+    for Move in Moves do
+    begin
+      E := FTree[Move.Key];
+      FTree.Remove(Move.Key);
+      FTree.AddOrSetValue(Move.Value, E);
+      Tail.Add(Move.Key + ' -> ' + Move.Value);
+    end;
+    Log(Format('Moved %d path(s) to follow Team Coherence: %s', [Moves.Count,
+      IfThen(Tail.Count <= 5, string.Join('; ', Tail.ToStringArray), Tail[0] + '; ...')]));
+    SaveUpdateCheckpoint;
+  finally
+    Tail.Free;
+    Moves.Free;
+    Marks.Free;
+    BySha.Free;
+    NewPath.Free;
+  end;
+end;
+
+procedure TPipeline.RunUpdate;
+// Adds every revision Team Coherence has that git does not, in check-in order, on top of the
+// verified tip - except one OLDER than a revision of the same file already in git: adding it
+// would put old content over new, so it is listed instead.
+var
+  Revs: TArray<TTCRevision>;
+  LastIdx: TDictionary<Cardinal, Integer>;
+  NewRevs: TList<TTCRevision>;
+  Behind: TStringList;
+  Key: string;
+  I, P, Idx, BatchEnd, Total, BatchNo, FetchWindow: Integer;
+begin
+  if not TestConnection then
+    raise Exception.Create(
+      'The Team Coherence server is not reachable.'#13#10#13#10 +
+      'Check the VPN, then run again - the update continues from where it stopped.');
+  LoadAuthorMap;
+
+  Revs := FSession.Revisions.ToArray;
+  SortChronologically(Revs);
+  LastIdx := TDictionary<Cardinal, Integer>.Create;
+  NewRevs := TList<TTCRevision>.Create;
+  Behind := TStringList.Create;
+  try
+    // where each file's history in git ends, in today's order
+    for I := 0 to High(Revs) do
+      if FLedger.ContainsKey(Format('%d|%s', [Revs[I].FileID, Revs[I].Revision])) then
+        LastIdx.AddOrSetValue(Revs[I].FileID, I);
+    for I := 0 to High(Revs) do
+    begin
+      Key := Format('%d|%s', [Revs[I].FileID, Revs[I].Revision]);
+      if FLedger.ContainsKey(Key) then Continue;
+      if LastIdx.TryGetValue(Revs[I].FileID, P) and (I < P) then
+        Behind.Add(Format('%d,%s,%s', [Revs[I].FileID, CsvQ(Revs[I].TCPath),
+          CsvQ(Revs[I].Revision)]))
+      else
+        NewRevs.Add(Revs[I]);
+    end;
+    if Behind.Count > 0 then
+    begin
+      Log(Format('  %d revision(s) not in git are older than a revision of the same file ' +
+        'that is; left out and listed in meta\update_behind.csv.', [Behind.Count]));
+      Behind.Insert(0, 'file_id,tc_path,revision');
+      Behind.SaveToFile(TPath.Combine(FOpt.MetaDir, 'update_behind.csv'), TEncoding.UTF8);
+    end;
+    FSorted := NewRevs.ToArray;
+  finally
+    Behind.Free;
+    NewRevs.Free;
+    LastIdx.Free;
+  end;
+
+  Total := Length(FSorted);
+  if Total = 0 then
+  begin
+    Log('Team Coherence has no check-ins that are not already in git.');
+    Exit;
+  end;
+  Log(Format('%d new revision(s) to add, checked in from %s to %s UTC.',
+    [Total, DateTimeToStr(FSorted[0].When), DateTimeToStr(FSorted[Total - 1].When)]));
+
+  FOverallTotal := Total;
+  FOverallBase := 0;
+  FRunStarted := Now;
+  FStartedAt := 0;
+  FDoneHigh := 0;
+  FFetchedTo := 0;
+  Idx := 0;
+  BatchNo := 0;
+  FHeartbeat := THeartbeatThread.Create(Self);
+  try
+    while (Idx < Total) and not Cancelled do
+    begin
+      Inc(BatchNo);
+      BatchEnd := Idx + FOpt.BatchSize;
+      if BatchEnd > Total then BatchEnd := Total;
+      while (BatchEnd < Total) and SameCheckIn(FSorted[BatchEnd - 1], FSorted[BatchEnd]) do
+        Inc(BatchEnd);
+      Item(Format('batch %d: revisions %d-%d of %d', [BatchNo, Idx + 1, BatchEnd, Total]));
+      FFailed := 0;
+      FOverallBase := Idx;
+      Overall(Idx, Total);
+
+      // a wide fetch window for the same reason as RunIncremental
+      if FFetchedTo < BatchEnd then
+      begin
+        FetchWindow := Idx + FOpt.BatchSize * 4;
+        if FetchWindow > Total then FetchWindow := Total;
+        FetchRange(FFetchedTo, FetchWindow);
+        FFetchedTo := FetchWindow;
+      end;
+      if FConnLost then
+      begin
+        Log(Format('Batch %d abandoned: the connection dropped. Nothing recorded for it.',
+          [BatchNo]));
+        FStoppedIncomplete := True;
+        Break;
+      end;
+      if Cancelled then Break;
+      if FFailed > 0 then
+        Log(Format('Batch %d: %d revision(s) could not be fetched - recorded in failed.csv ' +
+          'and left out of the history.', [BatchNo, FFailed]));
+
+      ImportRange(Idx, BatchEnd);
+      if Cancelled then Break;
+      for I := Idx to BatchEnd - 1 do
+      begin
+        FLedger.AddOrSetValue(Format('%d|%s', [FSorted[I].FileID, FSorted[I].Revision]), True);
+        FLedgerNew.Add(Format('%d,%s', [FSorted[I].FileID, CsvQ(FSorted[I].Revision)]));
+      end;
+      SaveUpdateCheckpoint;
+      Idx := BatchEnd;
+      Progress('Adding new check-ins', Idx, Total);
+      Overall(Idx, Total);
+    end;
+  finally
+    MergeSaveCsv('skipped.csv', 'file_id,tc_path,revision,reason', FSkippedRows);
+    MergeSaveCsv('failed.csv', 'file_id,tc_path,revision,reason', FFailedRows);
+    THeartbeatThread(FHeartbeat).Terminate;
+    THeartbeatThread(FHeartbeat).WaitFor;
+    FHeartbeat.Free;
+    FHeartbeat := nil;
+  end;
+
+  if FStoppedIncomplete then
+    raise Exception.CreateFmt('Stopped after %d of %d new revisions: the connection dropped. ' +
+      'Nothing was recorded for the incomplete batch; run again to continue.', [Idx, Total]);
+  if Cancelled then
+    Log(Format('Stopped after %d of %d new revisions. Run again to continue.', [Idx, Total]))
+  else
+    Log(Format('Added %d revision(s) from Team Coherence.', [Total]));
+end;
+
+procedure TPipeline.PushToRemote;
+// The branch is pushed WITHOUT force: the update checked the remote is at or behind this
+// repository, so a rejection means someone pushed in the meantime - a reason to stop, never to
+// overwrite. Tags are pushed with force, because a label re-applied in TC moves its tag.
+var
+  Out1: string;
+begin
+  SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0');
+  if not RemoteExists then
+    raise EUpdateRefused.CreateFmt('There is no remote "%s" to push to. Add it once with: ' +
+      'git -C "%s" remote add %s <url>', [FOpt.Remote, FOpt.RepoDir, FOpt.Remote]);
+  Log(Format('Pushing %s to %s...', [FOpt.Branch, FOpt.Remote]));
+  if GitOut(Format('push --porcelain %s refs/heads/%s:refs/heads/%s',
+            [FOpt.Remote, FOpt.Branch, FOpt.Branch]), Out1, 6 * 3600) <> 0 then
+    raise Exception.Create('git push of the branch failed:'#13#10 + Trim(Out1));
+  if FOpt.IncludeTags then
+  begin
+    Log(Format('Pushing tags to %s...', [FOpt.Remote]));
+    if GitOut(Format('push --porcelain %s +refs/tags/*:refs/tags/*', [FOpt.Remote]),
+              Out1, 6 * 3600) <> 0 then
+      raise Exception.Create('git push of the tags failed:'#13#10 + Trim(Out1));
+  end;
+  Log(Format('Pushed to %s.', [FOpt.Remote]));
 end;
 
 // ---------------------------------------------------------------- verify

@@ -16,9 +16,15 @@
       $env:TCPWD = 'the-password'
       .\Run-Migration.ps1
 
+  With -Update it brings an already-migrated work folder up to date instead: only the check-ins
+  made in Team Coherence since are added, on top of the tip that is on the remote, and -Push
+  publishes the result. An update that finds something it cannot account for exits 5, and this
+  supervisor stops rather than retrying.
+
 .EXAMPLE
   $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith
   $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags   # + labels
+  $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push
 
   Put the work folder on a volume with room for the blob cache AND the repository - about
   2.5x the size of the history. A 44,450-revision repository needed roughly 12 GB, and running
@@ -51,6 +57,15 @@ param(
   # Windows time zone of the TC server's clock, e.g. 'Eastern Standard Time'. TC stores wall-clock
   # time with no zone; empty means this PC's zone, which is wrong whenever the two differ.
   [string] $TimeZone = '',
+  # Add only what Team Coherence has that the repository does not, on top of the remote's tip.
+  # Needs the work folder of the original migration.
+  [switch] $Update,
+  # Push the branch (and with -Tags the tags) to -Remote after a successful run.
+  [switch] $Push,
+  [string] $Remote = 'origin',
+  # The original migration's checkpoint, when it is not state.txt in -Work (a first -Update
+  # reads it to learn what the migration put in git).
+  [string] $StateFile = '',
   [int]    $MaxAttempts = 400,
   [int]    $RetrySeconds = 60
 )
@@ -83,7 +98,18 @@ function ConvertTo-QuotedArg([string] $s) {
   return '"' + $s + '"'
 }
 
-Say "supervisor starting: work=$Work threads=$Threads conn=$Conn repo=$Repo tz=$TimeZone tags=$($Tags.IsPresent) dll=$(-not $NoDll.IsPresent)"
+# How far the run has got, to tell an attempt that advanced from one that did not: check-ins in
+# state.txt for a migration, handled revisions in update.txt for an update.
+function Get-Checkpoint {
+  if ($Update) { $file = Join-Path $Work 'update.txt'; $key = 'ledger_rows' }
+  else { $file = Join-Path $Work 'state.txt'; $key = 'committed' }
+  if (-not (Test-Path -LiteralPath $file)) { return 0 }
+  $m = Select-String -Path $file -Pattern "^$key=(\d+)" | Select-Object -First 1
+  if ($m) { return [int]$m.Matches[0].Groups[1].Value }
+  return 0
+}
+
+Say "supervisor starting: work=$Work threads=$Threads conn=$Conn repo=$Repo tz=$TimeZone tags=$($Tags.IsPresent) dll=$(-not $NoDll.IsPresent) update=$($Update.IsPresent) push=$($Push.IsPresent) remote=$Remote"
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   $log = Join-Path $Work ("migrate-{0:d3}.log" -f $attempt)
@@ -98,27 +124,23 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   if ($TimeZone) { $a += @('--tz', $TimeZone) }
   if ($Tags) { $a += '--tags' } else { $a += '--no-tags' }
   if ($NoDll) { $a += '--no-dll' } else { $a += '--dll' }
+  if ($Update) { $a += '--update' }
+  if ($StateFile) { $a += @('--state', $StateFile) }
+  if ($Push) { $a += @('--push', '--remote', $Remote) }
   $argLine = ($a | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
 
-  $before = 0
-  $state = Join-Path $Work 'state.txt'
-  if (Test-Path -LiteralPath $state) {
-    $m = Select-String -Path $state -Pattern '^committed=(\d+)' | Select-Object -First 1
-    if ($m) { $before = [int]$m.Matches[0].Groups[1].Value }
-  }
-
-  Say "attempt $attempt starting (checkpoint at $before check-ins)"
+  $before = Get-Checkpoint
+  Say "attempt $attempt starting (checkpoint at $before)"
   $p = Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -Wait
   $code = $p.ExitCode
-
-  $after = 0
-  if (Test-Path -LiteralPath $state) {
-    $m = Select-String -Path $state -Pattern '^committed=(\d+)' | Select-Object -First 1
-    if ($m) { $after = [int]$m.Matches[0].Groups[1].Value }
-  }
+  $after = Get-Checkpoint
 
   if ($code -eq 0) {
-    Say "attempt $attempt COMPLETED (checkpoint $before -> $after). Migration finished."
+    Say "attempt $attempt COMPLETED (checkpoint $before -> $after). Run finished."
+    break
+  }
+  if ($code -eq 5) {
+    Say "attempt $attempt REFUSED to continue (exit 5): something needs a person - see $log. Not retrying."
     break
   }
 

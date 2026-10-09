@@ -27,6 +27,8 @@ Every one of those comments describes something that actually happened.
 - **Resumable** — checkpoints every batch; a dropped VPN costs one batch, not the run
 - **Verified** — reconciles revisions against fetched content, runs `git fsck`, and checks every
   archive's fetched size against the size TC recorded for that revision
+- **Updatable** — `--update` adds later TC check-ins on top of the published branch, after
+  checking that every file at its tip is the content TC has for it, and `--push` publishes them
 
 ## Requirements
 
@@ -78,6 +80,8 @@ Used successfully for one large migration. Not widely tested — expect to read 
 - Some revisions may be unrecoverable: this repository had 6 that failed identically through two
   independent access paths, which is TC's storage being damaged rather than a tool problem
 - Windows only, and Win32 only, because the TC client DLLs are
+- Updates are one-way: TC to git. A commit made directly on the mirrored branch stops them
+- Update mode has not yet been run against a live Team Coherence server
 
 ## Licence
 

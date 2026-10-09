@@ -55,6 +55,13 @@ type
     FUseDll: Boolean;
     // Name of the bare repository inside the work folder (--repo). Default repo.git.
     FRepoName: string;
+    // --update: add only what TC has that git does not, on top of the published tip.
+    FUpdate: Boolean;
+    // --push: push branch and tags to FRemote (--remote, default origin) after a good run.
+    FPush: Boolean;
+    FRemote: string;
+    // --state: the migration's checkpoint file, if not state.txt in the work folder.
+    FStateFile: string;
     FWorker: TMigrationThread;
     // layout metrics, all derived from the rendered font in BuildUi
     FRowH, FBtnH, FPad, FGap, FLineH: Integer;
@@ -82,7 +89,7 @@ type
     procedure ConnectClick(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
     procedure RunClick(Sender: TObject);
-    procedure WorkerDone(Success: Boolean; const Summary: string);
+    procedure WorkerDone(Success, NeedsAttention: Boolean; const Summary: string);
     procedure StopClick(Sender: TObject);
     procedure OpenClick(Sender: TObject);
     procedure FormCloseQuery(Sender: TObject; var CanClose: Boolean);
@@ -106,6 +113,7 @@ constructor TMainForm.Create(AOwner: TComponent);
 begin
   inherited CreateNew(AOwner);
   FUseDll := True;   // measured faster AND more accurate than spawning tc.exe; --no-dll opts out
+  FRemote := 'origin';
   BuildUi;
   LoadSettings;
   ParseCommandLine;
@@ -258,6 +266,10 @@ begin
     else if A = '--pwd'      then begin FTcPwd := Next(I); Inc(I); end
     else if A = '--conn'     then begin FTcConn := Next(I); Inc(I); end
     else if A = '--tz'       then begin FTcZone := Next(I); Inc(I); end
+    else if A = '--update' then FUpdate := True
+    else if A = '--push' then FPush := True
+    else if A = '--remote'   then begin FRemote := Next(I); Inc(I); end
+    else if A = '--state'    then begin FStateFile := Next(I); Inc(I); end
     else if A = '--font'     then Inc(I);   // consumed in BuildUi
     ;
     Inc(I);
@@ -1036,6 +1048,10 @@ begin
   Opt.AuthorMapFile := edAuthors.Text;
   Opt.IncludeTags := cbTags.Checked;
   Opt.UseDll := FUseDll;
+  Opt.UpdateMode := FUpdate;
+  Opt.Remote := FRemote;
+  Opt.Push := FPush;
+  Opt.StateFile := FStateFile;
   Opt.FetchThreads := StrToIntDef(edThreads.Text, 8);
   // Check-ins per resumable batch. Larger batches also give the fetch workers more
   // distinct archives to choose from, which matters because one archive is never fetched
@@ -1051,7 +1067,7 @@ begin
     StrToIntDef(edLimit.Text, 0), DoLog, DoItem, DoCounters, DoOverall, DoProgress, WorkerDone);
 end;
 
-procedure TMainForm.WorkerDone(Success: Boolean; const Summary: string);
+procedure TMainForm.WorkerDone(Success, NeedsAttention: Boolean; const Summary: string);
 begin
   FWorker := nil;           // FreeOnTerminate - the thread disposes of itself
   SetBusy(False);
@@ -1068,6 +1084,10 @@ begin
     DoLog('FINISHED WITHOUT SUCCESS: ' + Summary);
     if not FAuto then MessageDlg(Summary, mtError, [mbOK], 0);
   end;
-  if FAuto then FinishAuto(IfThen(Success, 0, 1));
+  // 5: refused - something needs a person, so the supervisor must not relaunch
+  if FAuto then
+    if Success then FinishAuto(0)
+    else if NeedsAttention then FinishAuto(5)
+    else FinishAuto(1);
 end;
 end.

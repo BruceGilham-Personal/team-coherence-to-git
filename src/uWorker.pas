@@ -38,7 +38,9 @@ const
   StallMinutes = 10;
 
 type
-  TWorkerDone = procedure(Success: Boolean; const Summary: string) of object;
+  // NeedsAttention: the run refused to go on (EUpdateRefused). Retrying cannot help; a person
+  // has to look, so the supervisor stops instead of relaunching.
+  TWorkerDone = procedure(Success, NeedsAttention: Boolean; const Summary: string) of object;
 
   TMigrationThread = class(TThread)
   private
@@ -55,6 +57,7 @@ type
     FStep, FSteps: Integer;
     FSummary: string;
     FOk: Boolean;
+    FRefused: Boolean;
     FLastItem: TDateTime;
     FLastCounters: TDateTime;
     FLastOverall: TDateTime;
@@ -65,7 +68,7 @@ type
     FDoneReported: Integer;
     FWatchdog: TThread;
     procedure MarkWork;
-    procedure ReportDone(Success: Boolean; const Summary: string);
+    procedure ReportDone(Success, NeedsAttention: Boolean; const Summary: string);
     procedure QLog(const Msg: string);
     procedure QItem(const Detail: string);
     procedure QCounters(const S: string);
@@ -131,7 +134,7 @@ begin
       FOwner.QLog('*** The usual cause is a TC call blocked on a socket the VPN killed: TCP');
       FOwner.QLog('*** still reports the connection open and the DLL applies no timeout. The');
       FOwner.QLog('*** supervisor relaunches and the run resumes from its last checkpoint.');
-      FOwner.ReportDone(False, Format(
+      FOwner.ReportDone(False, False, Format(
         'Stalled: no progress for %.0f minutes. A relaunch resumes from the checkpoint.', [Mins]));
       Exit;
     end;
@@ -178,21 +181,22 @@ begin
   TInterlocked.Exchange(FLastWork, Int64(TThread.GetTickCount64));
 end;
 
-procedure TMigrationThread.ReportDone(Success: Boolean; const Summary: string);
+procedure TMigrationThread.ReportDone(Success, NeedsAttention: Boolean; const Summary: string);
 var
-  Ok: Boolean;
+  Ok, Attn: Boolean;
   Sum: string;
 begin
   // First caller wins. The watchdog may report a stall while the worker is still blocked in a
   // DLL call that later returns.
   if TInterlocked.CompareExchange(FDoneReported, 1, 0) <> 0 then Exit;
   Ok := Success;
+  Attn := NeedsAttention;
   Sum := Summary;
   if Assigned(FOnDone) then
     TThread.Queue(nil,
       procedure
       begin
-        FOnDone(Ok, Sum);
+        FOnDone(Ok, Attn, Sum);
       end);
 end;
 
@@ -276,14 +280,55 @@ end;
 procedure TMigrationThread.Execute;
 var
   Pipe: TPipeline;
-  I: Integer;
   Probe, SavedView: string;
+
+  // Reads the structure and the whole revision history from Team Coherence and saves it.
+  procedure ReadMetadata;
+  var
+    I: Integer;
+  begin
+    Phase('Reading the repository structure');
+    FSession.Folders.Clear;
+    FSession.Files.Clear;
+    FSession.Revisions.Clear;
+    FSession.Labels.Clear;
+    FSession.Attachments.Clear;
+    for I := 0 to High(FRoots) do
+    begin
+      if Terminated then Exit;
+      QLog(Format('Project id %d', [FRoots[I]]));
+      FSession.EnumTree(FRoots[I]);
+      FSession.EnumLabelsFor(FRoots[I]);
+    end;
+
+    if (FLimit > 0) and (FSession.Files.Count > FLimit) then
+    begin
+      QLog('');
+      QLog(Format('*** TEST RUN - LIMITED TO THE FIRST %d OF %d FILES ***',
+        [FLimit, FSession.Files.Count]));
+      QLog('*** This is NOT a full migration. Clear the limit to migrate everything. ***');
+      QLog('');
+      FSession.Files.DeleteRange(FLimit, FSession.Files.Count - FLimit);
+    end;
+
+    if Terminated then Exit;
+    Phase('Reading revision history');
+    FSession.EnumAllRevisions;
+    // Saved immediately: an interrupted run must never have to re-read 44,000 revisions from
+    // the server just to get back to where it was.
+    FSession.SaveCsvs(FOpt.MetaDir);
+    QLog('Metadata saved. A later run will reuse it instead of re-reading the server.');
+  end;
+
 begin
   NameThreadForDebugging('TC migration');
   FOk := False;
+  FRefused := False;
   FStep := 0;
   FSteps := 6;
   if FOpt.IncludeTags then Inc(FSteps);   // the label pass is a phase of its own
+  if FOpt.UpdateMode then Inc(FSteps, 2); // matching the repository, following moves
+  if FOpt.Push then Inc(FSteps);
   MarkWork;
   FWatchdog := TStallWatchdog.Create(Self);
   Pipe := TPipeline.Create(FSession, FOpt);
@@ -311,45 +356,29 @@ begin
         Pipe.SetView('<default>');
       end;
 
-      // ---- metadata: reload if a previous run already gathered it -------------------
-      if FSession.LoadCsvs(FOpt.MetaDir) then
+      if FOpt.UpdateMode then
+      begin
+        // ---- update: what is in git, checked; then Team Coherence as it is NOW ------------
+        Phase('Matching the repository to Team Coherence');
+        if FLimit > 0 then
+          raise EUpdateRefused.Create('--limit cannot be combined with --update: an update ' +
+            'has to see all of Team Coherence to know what is new.');
+        try
+          if not FSession.LoadCsvs(FOpt.MetaDir) then
+            raise EUpdateRefused.Create('There is no saved metadata in meta\, so there is no ' +
+              'migration here to update. Run a full migration first.');
+        except
+          on E: ETCError do raise EUpdateRefused.Create(E.Message);   // e.g. a zone mismatch
+        end;
+        Pipe.BeginUpdate;
+        if not Terminated then ReadMetadata;
+        if not Terminated and FOpt.IncludeTags then Pipe.PrepareLabelCarryOver;
+      end
+      // ---- metadata: reload if a previous run already gathered it -----------------------
+      else if FSession.LoadCsvs(FOpt.MetaDir) then
         QLog('Using the metadata saved by a previous run (delete meta\ to re-read it).')
       else
-      begin
-        Phase('Reading the repository structure');
-        FSession.Folders.Clear;
-        FSession.Files.Clear;
-        FSession.Revisions.Clear;
-        FSession.Labels.Clear;
-        FSession.Attachments.Clear;
-        for I := 0 to High(FRoots) do
-        begin
-          if Terminated then Break;
-          QLog(Format('Project id %d', [FRoots[I]]));
-          FSession.EnumTree(FRoots[I]);
-          FSession.EnumLabelsFor(FRoots[I]);
-        end;
-
-        if (FLimit > 0) and (FSession.Files.Count > FLimit) then
-        begin
-          QLog('');
-          QLog(Format('*** TEST RUN - LIMITED TO THE FIRST %d OF %d FILES ***',
-            [FLimit, FSession.Files.Count]));
-          QLog('*** This is NOT a full migration. Clear the limit to migrate everything. ***');
-          QLog('');
-          FSession.Files.DeleteRange(FLimit, FSession.Files.Count - FLimit);
-        end;
-
-        if not Terminated then
-        begin
-          Phase('Reading revision history');
-          FSession.EnumAllRevisions;
-          // Saved immediately: an interrupted run must never have to re-read 44,000
-          // revisions from the server just to get back to where it was.
-          FSession.SaveCsvs(FOpt.MetaDir);
-          QLog('Metadata saved. A later run will reuse it instead of re-reading the server.');
-        end;
-      end;
+        ReadMetadata;
 
       // ---- labels are optional and separately resumable ----------------------------
       // Always entered when tags are wanted, not only when no attachments are loaded yet: the
@@ -378,10 +407,21 @@ begin
       end;
 
       if not Terminated then
-      begin
-        Phase('Migrating check-ins, oldest first');
-        Pipe.RunIncremental;
-      end;
+        if FOpt.UpdateMode then
+        begin
+          Phase('Following files moved in Team Coherence');
+          Pipe.FollowMovedFiles;
+          if not Terminated then
+          begin
+            Phase('Adding new check-ins');
+            Pipe.RunUpdate;
+          end;
+        end
+        else
+        begin
+          Phase('Migrating check-ins, oldest first');
+          Pipe.RunIncremental;
+        end;
 
       // Labels after the history, because a label's tree is built from blobs the import has
       // already put in the object store, and before the deletion sweep, because a label
@@ -398,6 +438,15 @@ begin
         Pipe.RemoveDeletedFiles;
         Pipe.Verify;
       end;
+
+      // Last, and only after everything above succeeded: what is published is always a
+      // finished, verified run.
+      if not Terminated and FOpt.Push then
+      begin
+        Phase('Pushing to ' + FOpt.Remote);
+        Pipe.PushToRemote;
+      end;
+
       if Terminated then
         FSummary := 'Stopped at your request.'
       else
@@ -409,6 +458,12 @@ begin
           FSummary := Format('LIMITED TEST RUN (first %d files only) - ', [FLimit]) + FSummary;
       end;
     except
+      on E: EUpdateRefused do
+      begin
+        FRefused := True;
+        FSummary := E.Message;
+        QLog('REFUSED: ' + E.Message);
+      end;
       on E: Exception do
       begin
         FSummary := E.Message;
@@ -436,7 +491,7 @@ begin
       FWatchdog.Free;
       FWatchdog := nil;
     end;
-    ReportDone(FOk, FSummary);
+    ReportDone(FOk, FRefused, FSummary);
   end;
 end;
 
