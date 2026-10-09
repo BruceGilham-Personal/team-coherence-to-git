@@ -195,11 +195,29 @@ var
   TzTZI: TTimeZoneInformation;
   TzYear: Integer = 0;
 
+// '' becomes this PC's own key, so both cases convert the same way. TTimeZone.Local raised
+// ELocalTimeInvalid for a wall time inside a spring-forward gap, from inside a DLL callback.
+// False if the key does not exist.
+function ResolveTz: Boolean;
+var
+  Local: TDynamicTimeZoneInformation;
+begin
+  if TzKey = '' then
+  begin
+    FillChar(Local, SizeOf(Local), 0);
+    if GetDynamicTimeZoneInformation(Local) = TIME_ZONE_ID_INVALID then Exit(False);
+    TzKey := PWideChar(@Local.TimeZoneKeyName[0]);
+  end;
+  FillChar(TzDTZI, SizeOf(TzDTZI), 0);
+  StrPLCopy(PWideChar(@TzDTZI.TimeZoneKeyName[0]), TzKey, High(TzDTZI.TimeZoneKeyName));
+  Result := GetTimeZoneInformationForYear(2020, @TzDTZI, TzTZI);
+  TzYear := 0;
+end;
+
 function WallToUtc(const Wall: TDateTime): TDateTime;
 var
   L, U: TSystemTime;
 begin
-  if TzKey = '' then Exit(TTimeZone.Local.ToUniversalTime(Wall));
   if YearOf(Wall) <> TzYear then
   begin
     FillChar(TzDTZI, SizeOf(TzDTZI), 0);
@@ -763,6 +781,14 @@ begin
     end;
 
     if not (ModeProbe or ModeRaw or ModeExtract or ModeConnect or ModeConns or ModeGet or ModeRevs) then begin Usage; Halt(2); end;
+    // Checked here, not on the first date: inside a DLL callback the failure would unwind
+    // through the TC DLL's stack.
+    if not ResolveTz then
+    begin
+      Say(Format('unknown time zone "%s" - use a Windows key, e.g. "Eastern Standard Time"',
+        [TzKey]));
+      Halt(2);
+    end;
     if ModeExtract and (OutDir = '') then begin Say('-extract needs -out <dir>'); Halt(2); end;
     if ModeGet then
     begin

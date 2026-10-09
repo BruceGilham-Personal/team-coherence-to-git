@@ -174,6 +174,8 @@ type
 // 'Eastern Standard Time', or '' for this PC's zone. False if the key does not exist.
 function SetTCTimeZone(const KeyName: string): Boolean;
 function TCTimeZoneName: string;
+// The Windows key in use, resolved even when it is this PC's zone.
+function TCTimeZoneKey: string;
 function TCWallToUtc(const Wall: TDateTime): TDateTime;
 
 // CSV field quoting and parsing shared by every metadata file.
@@ -240,6 +242,8 @@ var
   GAttachWriter: TStreamWriter = nil;
   // "Login - <connection>" for the window-raising thread; set from the session.
   GLoginTitle: string = '';
+  // First exception caught inside a DLL callback; see CheckCallbackError.
+  GCallbackError: string = '';
 
 function S(P: PTCChar): string;
 begin
@@ -253,27 +257,48 @@ end;
 // Empty means "this PC's zone". Otherwise a Windows time zone key such as
 // 'Eastern Standard Time'; GetTimeZoneInformationForYear applies the rules in force in each
 // year, so dates before the 2007 US daylight-saving change convert correctly.
+//
+// "This PC's zone" is resolved to its key and converted the same way, rather than through
+// TTimeZone.Local. That raises ELocalTimeInvalid for a wall time inside a spring-forward gap,
+// and raised inside a DLL callback it unwinds through the TC DLL's own stack frames.
 
 var
   GTCZoneKey: string = '';
+  GTCZoneIsLocal: Boolean = True;
   GTCZoneDTZI: TDynamicTimeZoneInformation;
   GTCZoneTZI: TTimeZoneInformation;
   GTCZoneYear: Integer = 0;
 
 function SetTCTimeZone(const KeyName: string): Boolean;
+var
+  Key: string;
+  Local: TDynamicTimeZoneInformation;
 begin
-  GTCZoneKey := '';
   GTCZoneYear := 0;
-  if KeyName = '' then Exit(True);
+  GTCZoneIsLocal := KeyName = '';
+  Key := KeyName;
+  if Key = '' then
+  begin
+    FillChar(Local, SizeOf(Local), 0);
+    if GetDynamicTimeZoneInformation(Local) = TIME_ZONE_ID_INVALID then Exit(False);
+    Key := PWideChar(@Local.TimeZoneKeyName[0]);
+  end;
   FillChar(GTCZoneDTZI, SizeOf(GTCZoneDTZI), 0);
-  StrPLCopy(PWideChar(@GTCZoneDTZI.TimeZoneKeyName[0]), KeyName, High(GTCZoneDTZI.TimeZoneKeyName));
+  StrPLCopy(PWideChar(@GTCZoneDTZI.TimeZoneKeyName[0]), Key, High(GTCZoneDTZI.TimeZoneKeyName));
   Result := GetTimeZoneInformationForYear(2020, @GTCZoneDTZI, GTCZoneTZI);   // also proves the key exists
-  if Result then GTCZoneKey := KeyName;
+  if Result then GTCZoneKey := Key else GTCZoneKey := '';
+end;
+
+function TCTimeZoneKey: string;
+begin
+  if GTCZoneKey = '' then SetTCTimeZone('');
+  Result := GTCZoneKey;
 end;
 
 function TCTimeZoneName: string;
 begin
-  if GTCZoneKey = '' then Result := TTimeZone.Local.ID + ' (this PC)' else Result := GTCZoneKey;
+  Result := TCTimeZoneKey;
+  if GTCZoneIsLocal then Result := Result + ' (this PC)';
 end;
 
 function TCWallToUtc(const Wall: TDateTime): TDateTime;
@@ -281,7 +306,7 @@ var
   Y: Integer;
   L, U: TSystemTime;
 begin
-  if GTCZoneKey = '' then Exit(TTimeZone.Local.ToUniversalTime(Wall));
+  if (GTCZoneKey = '') and not SetTCTimeZone('') then RaiseLastOSError;
   Y := YearOf(Wall);
   if Y <> GTCZoneYear then
   begin
@@ -308,7 +333,24 @@ begin
     Result := TCWallToUtc(FileDateToDateTime(TS));
   except
     on EConvertError do Result := 0;   // bit fields that do not form a real date
+    // Anything else must not unwind through the DLL that called us: keep the first one and
+    // raise it once the enumeration has returned (CheckCallbackError).
+    on E: Exception do
+    begin
+      if GCallbackError = '' then GCallbackError := E.ClassName + ': ' + E.Message;
+      Result := 0;
+    end;
   end;
+end;
+
+procedure CheckCallbackError;
+var
+  Msg: string;
+begin
+  if GCallbackError = '' then Exit;
+  Msg := GCallbackError;
+  GCallbackError := '';
+  raise ETCError.Create('Converting a Team Coherence date failed: ' + Msg);
 end;
 
 // ---------------------------------------------------------------- callbacks
@@ -813,6 +855,7 @@ begin
     GCurrentTCPath := Files[I].TCPath;
     Item(Format('%s  (%d revisions so far)', [Files[I].TCPath, Revisions.Count]));
     Fn(GCurrentFileID, nil, nil, CbRevisions);
+    CheckCallbackError;
     Progress('Reading revision history', I + 1, Files.Count);
   end;
   Log(Format('Revisions: %d', [Revisions.Count]));
@@ -825,7 +868,9 @@ begin
   Fn := Api('TCDVcsEnumLabels');
   if not Assigned(Fn) then Exit;
   Fn(RootID, 0, lt_VersionLabel, nil, nil, CbLabels);
+  CheckCallbackError;
   Fn(RootID, 0, lt_PromotionLabel, nil, nil, CbLabels);
+  CheckCallbackError;
   Log(Format('  labels:  %d total', [Labels.Count]));
 end;
 
