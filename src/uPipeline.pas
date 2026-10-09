@@ -1859,8 +1859,11 @@ begin
       FetchRange(FFetchedTo, FetchWindow);
       FFetchedTo := FetchWindow;
     end;
-    if Cancelled or FConnLost then Break;
-
+    // FConnLost is tested BEFORE the generic Cancelled check, because Cancelled is also true
+    // when the link is lost. Testing Cancelled first skipped this block, so a lost connection
+    // returned normally, the run reported success with exit 0, and the supervisor stopped
+    // relaunching a migration that was only partly done.
+    //
     // A dropped connection stops the run without committing, so the checkpoint never
     // marches past a gap. But a revision that is genuinely unfetchable must not block the
     // other 44,000: it is recorded in meta\failed.csv and reported at the end, so it is
@@ -1872,6 +1875,7 @@ begin
       FStoppedIncomplete := True;
       Break;
     end;
+    if Cancelled then Break;
     if FFailed > 0 then
       Log(Format('Batch %d: %d revision(s) could not be fetched - recorded in failed.csv ' +
         'and left out of the history.', [BatchNo, FFailed]));
