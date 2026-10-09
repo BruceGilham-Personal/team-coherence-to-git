@@ -5,9 +5,10 @@ unit uWorker;
   Threading model
   ---------------
     UI thread        - the window only. Never calls the Team Coherence API and never blocks.
-    Migration thread - one thread, and the ONLY thread that touches the TC API DLLs.
-    Fetch workers    - a small pool inside TPipeline that runs tc.exe. Separate processes,
-                       no DLL calls, so they parallelise safely.
+    Migration thread - one thread, and the only one that enumerates through the TC API DLLs.
+    Fetch workers    - a pool inside TPipeline. With --no-dll each runs its own tc.exe, so
+                       they parallelise safely; through the DLL (the default) there is exactly
+                       one, and TTCSession serialises its content calls as well.
 
   Why it matters: a single TCDVcsEnumFiles call can sit inside the DLL for minutes. Pumping
   messages between callbacks is not enough - during one long call nothing pumps at all and

@@ -2,15 +2,17 @@ unit uPipeline;
 {
   Everything after metadata extraction:
 
-    1. Fetch   - tc.exe Get -VR<rev> for every revision, into a content-addressed blob cache
-    2. Build   - turn metadata + blobs into a git fast-import stream (native; no Node.js)
+    1. Fetch   - every revision's content, into a content-addressed blob cache: through the
+                 TC DLL (TCDVcsCheckOutFile with Lock = False) by default, or tc.exe Get -VR<rev>
+                 with --no-dll
+    2. Build   - turn metadata + blobs into a git fast-import stream, one batch at a time
     3. Import  - git fast-import into a bare repository
     4. Verify  - compare what landed in git against what came out of Team Coherence
 
   Only two external programs are used, both vendor binaries rather than editable scripts:
   tc.exe (Team Coherence) and git.exe.
 
-  READ-ONLY against Team Coherence: the only verb ever issued is Get.
+  READ-ONLY against Team Coherence: the only content verb ever issued is a Get.
 }
 
 interface
@@ -58,11 +60,10 @@ type
     FAuthors: TStringList;
     FLock: TCriticalSection;
     FManifest: TStringList;
-    FNextIdx, FDone, FFailed, FConsecFail: Integer;
+    FDone, FFailed, FConsecFail: Integer;
     FConnLost: Boolean;
     FStoppedIncomplete: Boolean;
     FEmpty: Integer;
-    FBadFile: TDictionary<Cardinal, Integer>;   // consecutive failures per file
     FInFlight: TDictionary<Cardinal, Boolean>;  // files being fetched right now
     FPending: TList<Integer>;                   // revisions still to claim in this batch
     FSkippedRows: TStringList;
@@ -83,7 +84,6 @@ type
     FLastOut: string;
     function StatePath: string;
     function TestConnection: Boolean;
-    function FileIsFetchable(const TCPath: string): Boolean;
     function ReadCheckpoint: Integer;
     procedure WriteCheckpoint(Index: Integer; const Extra: string);
     procedure LoadBlobManifest;
@@ -133,8 +133,6 @@ type
     function GetCurrentView: string;
     function SetView(const ViewName: string): Boolean;
   public
-    procedure FetchAll;
-    procedure BuildAndImport;
     procedure RunIncremental;
     procedure RemoveDeletedFiles;
     procedure Verify;
@@ -160,7 +158,6 @@ begin
   FManifest := TStringList.Create;
   FHaveBlob := TDictionary<string, Boolean>.Create;
   FSkippedRows := TStringList.Create;
-  FBadFile := TDictionary<Cardinal, Integer>.Create;
   FInFlight := TDictionary<Cardinal, Boolean>.Create;
   FPending := TList<Integer>.Create;
   FFailedRows := TStringList.Create;
@@ -174,7 +171,6 @@ begin
   FManifest.Free;
   FHaveBlob.Free;
   FSkippedRows.Free;
-  FBadFile.Free;
   FInFlight.Free;
   FPending.Free;
   FFailedRows.Free;
@@ -421,23 +417,21 @@ end;
 // ---------------------------------------------------------------- fetch (parallel)
 
 type
-  // Each worker pulls the next revision index and runs its own tc.exe. No Team Coherence
-  // API call happens here - only separate processes - so this is safe to parallelise even
-  // though the DLL itself is confined to a single thread.
+  // Each worker pulls the next revision index and fetches it. With --no-dll that is its own
+  // tc.exe process, so several can run at once. Through the DLL there is exactly one worker
+  // (FetchRange), and the session serialises its calls as well.
   TFetchWorker = class(TThread)
   private
     FPipe: TPipeline;
-    FCount: Integer;
   protected
     procedure Execute; override;
   public
-    constructor Create(APipe: TPipeline; ACount: Integer);
+    constructor Create(APipe: TPipeline);
   end;
 
-constructor TFetchWorker.Create(APipe: TPipeline; ACount: Integer);
+constructor TFetchWorker.Create(APipe: TPipeline);
 begin
   FPipe := APipe;
-  FCount := ACount;
   inherited Create(False);
 end;
 
@@ -530,8 +524,8 @@ var
   Tmp, Sha, Dest, RelDir, Out1, ListFile: string;
   Names: TArray<string>;
   B: TBlob;
-  Rc, J, Attempt, GotBytes: Integer;
-  Ok, NoStoredFile, SuspectLink, CheckFile: Boolean;
+  Rc, J, Attempt: Integer;
+  Ok, NoStoredFile, SuspectLink: Boolean;
   Keep: TArray<string>;
 begin
   R := FSorted[Index];
@@ -542,22 +536,13 @@ begin
   finally
     FLock.Leave;
   end;
-  // A file that has failed repeatedly is not retried for its remaining revisions. Some
-  // archives cannot be fetched at all ("No files found under ..."), and one of them had
-  // 1,241 revisions - four retries each would have burnt over an hour to no purpose.
-  FLock.Enter;
-  try
-    // DELIBERATELY NOT SKIPPING WHOLE FILES ANY MORE.
-    // Writing off a file after N failures was tried twice and lost real history both times:
-    // first 13 files / 5,882 revisions at 10 workers, then 3 more at 6 workers - including
-    // files proven fetchable by hand seconds later. Empty results under load are
-    // indistinguishable from a dead archive, so every revision now gets its own retries and
-    // its own entry in failed.csv. The cost is wasted retries on genuinely dead archives;
-    // the alternative is silently missing history, which is far worse.
-
-  finally
-    FLock.Leave;
-  end;
+  // DELIBERATELY NOT SKIPPING WHOLE FILES.
+  // Writing off a file after N failures was tried twice and lost real history both times:
+  // first 13 files / 5,882 revisions at 10 workers, then 3 more at 6 workers - including
+  // files proven fetchable by hand seconds later. Empty results under load are
+  // indistinguishable from a dead archive, so every revision gets its own retries and its own
+  // entry in failed.csv. The cost is wasted retries on genuinely dead archives; the
+  // alternative is silently missing history, which is far worse.
   WaitIfPaused;
   Item(Format('%s @ %s', [R.TCPath, R.Revision]));
   // one clean folder per revision, so we always know exactly what came back
@@ -573,7 +558,6 @@ begin
     NoStoredFile := False;
     SuspectLink := False;
     ListFile := '';
-    CheckFile := False;
     Names := nil;
     // MEASURED: about 6%% of fetches come back empty under load, at 2 threads as much as 4,
     // and every one of them succeeds on a later serial retry. So the answer is more patience
@@ -619,9 +603,6 @@ begin
           end;
         Names := Keep;
       end;
-      GotBytes := 0;
-      for J := 0 to High(Names) do
-        GotBytes := GotBytes + TFile.GetSize(Names[J]);
 
       // success is content arriving, or a revision that genuinely has none
       Ok := (Rc = 0) and ((Length(Names) > 0) or (R.Size <= 0));
@@ -686,41 +667,9 @@ begin
             [R.TCPath, R.Revision, R.Size]));
         FFailedRows.Add(Format('%d,%s,%s,expected %d bytes, nothing returned',
           [R.FileID, R.TCPath, R.Revision, R.Size]));
-        if FBadFile.ContainsKey(R.FileID) then FBadFile[R.FileID] := FBadFile[R.FileID] + 1
-        else FBadFile.Add(R.FileID, 1);
-        CheckFile := False;   // see the note above: files are never written off
         SuspectLink := (FConsecFail >= 5) and not FConnLost;
       finally
         FLock.Leave;
-      end;
-
-      // Never condemn a file on a count alone - PROVE it is unfetchable by asking for its
-      // tip. Counting strikes wrongly wrote off 15 healthy files (10,900 revisions, 24% of
-      // the history) when the real cause was concurrent access to one archive.
-      if CheckFile then
-      begin
-        if FileIsFetchable(R.TCPath) then
-        begin
-          FLock.Enter;
-          try
-            FBadFile.Remove(R.FileID);
-            Log(Format('  (%s does fetch at tip - keeping it, failures were transient)',
-              [R.TCPath]));
-          finally
-            FLock.Leave;
-          end;
-        end
-        else
-        begin
-          FLock.Enter;
-          try
-            FBadFile[R.FileID] := 999;     // proven unfetchable
-            Log(Format('  -> %s cannot be fetched at any revision; the rest are skipped',
-              [R.TCPath]));
-          finally
-            FLock.Leave;
-          end;
-        end;
       end;
 
       // Do not INFER a dropped connection from a run of failures - verify it. Five failures
@@ -824,67 +773,6 @@ begin
     end;
   end;
 end;
-procedure TPipeline.FetchAll;
-var
-  Workers: TArray<TFetchWorker>;
-  Total, I, N, LastDone: Integer;
-  Running: Boolean;
-begin
-  TDirectory.CreateDirectory(FOpt.CacheDir);
-  FBlobs.Clear;
-  FManifest.Clear;
-  FManifest.Add('file_id,revision,member,sha256,size,cache_path');
-  FNextIdx := 0;
-  FDone := 0;
-  FFailed := 0;
-  Total := FSession.Revisions.Count;
-  if Total = 0 then Exit;
-
-  N := FOpt.FetchThreads;
-  if N < 1 then N := 1;
-  if FOpt.UseDll then N := 1;   // see FetchRange
-  // MEASURED CEILING: at 10 workers the server began returning empty results for healthy
-  // archives, which this program can only read as "unfetchable". Six ran for hours with no
-  // failures at all. Do not raise this to chase throughput.
-  if N > 6 then
-  begin
-    Log(Format('  capping fetch workers at 6 (asked for %d): above that the server returns', [N]));
-    Log('  empty results for healthy archives, which looks exactly like missing data.');
-    N := 6;
-  end;
-  Log(Format('Fetching %d revisions with %d parallel workers...', [Total, N]));
-
-  SetLength(Workers, N);
-  for I := 0 to N - 1 do
-    Workers[I] := TFetchWorker.Create(Self, Total);
-  try
-    LastDone := -1;
-    repeat
-      Sleep(150);
-      if FDone <> LastDone then
-      begin
-        LastDone := FDone;
-        Progress('Fetching file contents', FDone, Total);
-        Item(Format('%d blobs cached, %d failures', [FBlobs.Count, FFailed]));
-      end;
-      Running := False;
-      for I := 0 to N - 1 do
-        if not Workers[I].Finished then Running := True;
-    until not Running;
-  finally
-    for I := 0 to N - 1 do
-    begin
-      Workers[I].Terminate;
-      Workers[I].WaitFor;
-      Workers[I].Free;
-    end;
-  end;
-
-  FManifest.WriteBOM := False;
-  FManifest.SaveToFile(TPath.Combine(FOpt.MetaDir, 'blobs.csv'), TEncoding.UTF8);
-  Progress('Fetching file contents', Total, Total);
-  Log(Format('Fetched %d blobs from %d revisions, %d failures.', [FBlobs.Count, Total, FFailed]));
-end;
 
 function TPipeline.StartFastImport(out ProcInfo: TProcessInformation;
   out StdInWrite: THandle): Boolean;
@@ -975,242 +863,6 @@ type
   TChange = record
     Path, Sha: string;
   end;
-
-// ============================================================================================
-// DEAD CODE - NOTHING CALLS THIS. Kept only because it is the original whole-repository import.
-//
-// It cost real damage: it contains the ONLY tag-writing code the project had, so `--tags` looked
-// implemented for weeks while every run that used it enumerated 44,450 label attachments and then
-// created no refs at all. The live path is RunIncremental -> ImportRange, and labels are now
-// handled by ImportTags. Do not add anything here expecting it to run.
-// ============================================================================================
-procedure TPipeline.BuildAndImport;
-var
-  StreamFile: string;
-  FS: TStream;
-  GitProc: TProcessInformation;
-  GitIn: THandle;
-  Piped: Boolean;
-  Marks: TDictionary<string, Integer>;
-  Order: TList<Integer>;
-  I, J, K, Mark, CommitCount, TagCount: Integer;
-  Revs: TArray<TTCRevision>;
-  R: TTCRevision;
-  B: TBlob;
-  Author, Comment, Ep: string;
-  GroupStart: TDateTime;
-  GroupAuthor, GroupComment: string;
-  Pending: TList<TChange>;
-  Chg: TChange;
-  Out1: string;
-  Rc: Integer;
-
-  // fast-import is a byte stream, not a text file: a blob is 'data <count>' followed by
-  // exactly that many raw bytes. Anything that re-encodes would corrupt every binary file
-  // (and every DFM), so everything is written as bytes.
-  procedure Put(const Line: string);
-  var
-    Bytes: TBytes;
-  begin
-    Bytes := TEncoding.UTF8.GetBytes(Line + #10);
-    FS.WriteBuffer(Bytes[0], Length(Bytes));
-  end;
-
-  procedure PutFileBytes(const FileName: string);
-  var
-    Src: TFileStream;
-    LF: Byte;
-  begin
-    Src := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
-    try
-      FS.CopyFrom(Src, 0);
-    finally
-      Src.Free;
-    end;
-    LF := 10;
-    FS.WriteBuffer(LF, 1);
-  end;
-
-  procedure EmitBlobsFor(const Rev: TTCRevision);
-  var
-    N: Integer;
-    Bl: TBlob;
-    CacheFile: string;
-  begin
-    for N := 0 to FBlobs.Count - 1 do
-    begin
-      Bl := FBlobs[N];
-      if (Bl.FileID <> Rev.FileID) or (Bl.Revision <> Rev.Revision) then Continue;
-      if not Marks.ContainsKey(Bl.Sha) then
-      begin
-        CacheFile := TPath.Combine(FOpt.CacheDir,
-          StringReplace(Bl.CachePath, '/', PathDelim, [rfReplaceAll]));
-        if not TFile.Exists(CacheFile) then
-        begin
-          Log('  missing cached blob: ' + Bl.CachePath);
-          Continue;
-        end;
-        Inc(Mark);
-        Marks.Add(Bl.Sha, Mark);
-        Put('blob');
-        Put('mark :' + IntToStr(Mark));
-        Put('data ' + IntToStr(TFile.GetSize(CacheFile)));
-        PutFileBytes(CacheFile);
-      end;
-      Chg.Path := MemberPath(Rev.TCPath, Bl.Member);
-      Chg.Sha := Bl.Sha;
-      Pending.Add(Chg);
-    end;
-  end;
-
-  procedure FlushCommit;
-  var
-    N: Integer;
-    Msg: string;
-  begin
-    if Pending.Count = 0 then Exit;
-    Inc(CommitCount);
-    Msg := GroupComment;
-    if Trim(Msg) = '' then Msg := '(no check-in comment)';
-    Put('commit refs/heads/' + FOpt.Branch);
-    Put(Format('committer %s %d +0000',
-      [MapAuthor(GroupAuthor), DateTimeToUnix(GroupStart, True)]));   // UTC, matching uTCApi
-    Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
-    Put(Msg);
-    for N := 0 to Pending.Count - 1 do
-      if Marks.ContainsKey(Pending[N].Sha) then
-        Put(Format('M 100644 :%d %s', [Marks[Pending[N].Sha], Pending[N].Path]));
-    Pending.Clear;
-  end;
-
-begin
-  LoadAuthorMap;
-  StreamFile := TPath.Combine(FOpt.WorkDir, 'stream.fi');
-  Marks := TDictionary<string, Integer>.Create;
-  Pending := TList<TChange>.Create;
-  Order := TList<Integer>.Create;
-  try
-    // check-ins in time order; a changeset is a run of revisions by the same author with the
-    // same comment inside the grouping window (the cvs2git approach)
-    Revs := FSession.Revisions.ToArray;
-    TArray.Sort<TTCRevision>(Revs, TComparer<TTCRevision>.Construct(
-      function(const A, B: TTCRevision): Integer
-      begin
-        Result := CompareDateTime(A.When, B.When);
-        if Result = 0 then Result := CompareStr(A.Author, B.Author);
-      end));
-
-    // the repository must exist before fast-import is started
-    if not TDirectory.Exists(FOpt.RepoDir) then
-    begin
-      TDirectory.CreateDirectory(FOpt.RepoDir);
-      RunProcess(FOpt.GitExe, 'init --bare', FOpt.RepoDir, Out1);
-      Log('Created bare repository: ' + FOpt.RepoDir);
-    end;
-
-    Mark := 0;
-    CommitCount := 0;
-    TagCount := 0;
-    // Feed git directly. The stream contains every blob inline, so writing it to disk
-    // would need as much free space again as the entire blob cache.
-    GitIn := 0;
-    Piped := StartFastImport(GitProc, GitIn);
-    if Piped then
-    begin
-      FS := THandleStream.Create(GitIn);
-      Log('Streaming directly into git fast-import (no intermediate file).');
-    end
-    else
-    begin
-      FS := TFileStream.Create(StreamFile, fmCreate);
-      Log('Could not start git fast-import; writing the stream to disk instead.');
-    end;
-    try
-      GroupAuthor := #0;
-      GroupComment := #0;
-      GroupStart := 0;
-      for I := 0 to High(Revs) do
-      begin
-        if Cancelled then Break;
-        R := Revs[I];
-        if (R.Author <> GroupAuthor) or (R.Comment <> GroupComment) or
-           (SecondsBetween(R.When, GroupStart) > FOpt.WindowSeconds) then
-        begin
-          FlushCommit;
-          GroupAuthor := R.Author;
-          GroupComment := R.Comment;
-          GroupStart := R.When;
-        end;
-        EmitBlobsFor(R);
-        if (I mod 50 = 0) or (I = High(Revs)) then
-          Progress('Building the git history', I + 1, Length(Revs));
-      end;
-      FlushCommit;
-
-      // Tags: a label's attachment list IS the label, so rebuild that exact tree.
-      if FOpt.IncludeTags then
-        for I := 0 to FSession.Labels.Count - 1 do
-        begin
-          if Cancelled then Break;
-          if FSession.Labels[I].LabelType <> 1 then Continue;
-          Pending.Clear;
-          for J := 0 to FSession.Attachments.Count - 1 do
-            if FSession.Attachments[J].LabelID = FSession.Labels[I].ID then
-              for K := 0 to FSession.Revisions.Count - 1 do
-                if (FSession.Revisions[K].FileID = FSession.Attachments[J].FileID) and
-                   (FSession.Revisions[K].Revision = FSession.Attachments[J].Revision) then
-                begin
-                  EmitBlobsFor(FSession.Revisions[K]);
-                  Break;
-                end;
-          if Pending.Count = 0 then Continue;
-          Inc(TagCount);
-          Ep := 'refs/heads/tc/label/' + StringReplace(FSession.Labels[I].Name, ' ', '_', [rfReplaceAll]);
-          Put('commit ' + Ep);
-          Put(Format('committer %s %d +0000',
-            [MapAuthor('tc'), DateTimeToUnix(FSession.Labels[I].When, True)]));
-          Comment := FSession.Labels[I].Name + #10 + FSession.Labels[I].Comment;
-          Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Comment))));
-          Put(Comment);
-          Put('deleteall');        // the label defines the whole tree, not a delta
-          for J := 0 to Pending.Count - 1 do
-            if Marks.ContainsKey(Pending[J].Sha) then
-              Put(Format('M 100644 :%d %s', [Marks[Pending[J].Sha], Pending[J].Path]));
-          Pending.Clear;
-          Progress('Rebuilding labels as tags', I + 1, FSession.Labels.Count);
-        end;
-    finally
-      FS.Free;
-    end;
-    if Piped then
-    begin
-      Log(Format('Streamed: %d commits, %d label trees, %d blobs. Waiting for git...',
-        [CommitCount, TagCount, Marks.Count]));
-      Progress('Importing into git', 0, 1);
-      Rc := FinishFastImport(GitProc, GitIn, Out1);
-    end
-    else
-    begin
-      Log(Format('Stream written: %d commits, %d label trees, %d blobs -> %s',
-        [CommitCount, TagCount, Marks.Count, StreamFile]));
-      Progress('Importing into git', 0, 1);
-      Rc := RunProcess(FOpt.GitExe, 'fast-import --quiet --max-pack-size=1g',
-        FOpt.RepoDir, Out1, StreamFile);
-    end;
-    if Rc <> 0 then
-    begin
-      Log('git fast-import FAILED:');
-      Log(Out1);
-      raise Exception.Create('git fast-import failed - see the log.');
-    end;
-    Progress('Importing into git', 1, 1);
-    Log('Import complete.');
-  finally
-    Marks.Free;
-    Pending.Free;
-    Order.Free;
-  end;
-end;
 
 // ---------------------------------------------------------------- connection heartbeat
 //
@@ -1400,37 +1052,6 @@ end;
 //     repository, so commits continue the existing history rather than forking it.
 
 
-
-function TPipeline.FileIsFetchable(const TCPath: string): Boolean;
-// Asks for the file's tip. If that comes back, the archive is fine and any failures on
-// individual revisions were transient - so the file must not be written off.
-//
-// Tried several times with a pause between: under heavy concurrency the server returns
-// empty results even for healthy archives, and a single failed check once condemned 13
-// perfectly good files - 5,882 revisions of real history.
-var
-  Dir, Out1: string;
-  Attempt: Integer;
-begin
-  Result := False;
-  for Attempt := 1 to 3 do
-  begin
-    Dir := TPath.Combine(FOpt.WorkDir, 'check-' + TGuid.NewGuid.ToString.Substring(1, 8));
-    TDirectory.CreateDirectory(Dir);
-    try
-      RunProcess(FOpt.TcExe, Format('Get "%s" "-GL%s" -W -T', [TCPath, Dir]), FOpt.WorkDir, Out1);
-      Result := Length(TDirectory.GetFiles(Dir, '*', TSearchOption.soAllDirectories)) > 0;
-    finally
-      try
-        TDirectory.Delete(Dir, True);
-      except
-      end;
-    end;
-    if Result then Exit;
-    Sleep(2000);
-  end;
-end;
-
 function TPipeline.TestConnection: Boolean;
 // 'Views' is a cheap read that has to reach the server, so it answers "is the link up?"
 // in about a second - long before thousands of Get calls start failing one by one.
@@ -1589,7 +1210,6 @@ begin
   LastLogged := 0;
   FRangeStart := StartIdx;
   FRangeEnd := EndIdx;
-  FNextIdx := 0;
   FDone := 0;
   FStartedAt := FOverallBase;
   // the batch as a claimable pool, so a worker can skip a busy archive instead of waiting
@@ -1610,7 +1230,7 @@ begin
 
   SetLength(Workers, N);
   for I := 0 to N - 1 do
-    Workers[I] := TFetchWorker.Create(Self, EndIdx);
+    Workers[I] := TFetchWorker.Create(Self);
   try
     repeat
       Sleep(100);
@@ -2120,13 +1740,13 @@ procedure TPipeline.ImportTags;
 //
 // A TC version label is not a pointer to a check-in - it is a list of (file, revision) pairs,
 // which can mix revisions from any point in history and need not correspond to any commit that
-// ever existed on the trunk. So a label cannot honestly be a git tag pointing at a commit: it is
-// emitted as a root commit with `deleteall` plus exactly the labelled revisions, on
-// refs/heads/tc/label/<name>.
+// ever existed on the trunk. So a label cannot honestly be a git tag pointing at a trunk
+// commit: it is emitted as a root commit with `deleteall` plus exactly the labelled revisions,
+// on refs/tags/<name>.
 //
-// This work used to live in BuildAndImport, which nothing calls - so every run that passed
-// --tags enumerated 44,450 attachments and then created no refs whatsoever. The lookups here are
-// indexed; the original's nested scan was labels x attachments x 44,450 revisions.
+// This work once lived in a whole-repository import that nothing called, so every run that
+// passed --tags enumerated 44,450 attachments and then created no refs whatsoever. The lookups
+// here are indexed; the original's nested scan was labels x attachments x 44,450 revisions.
 const
   // TC label types. uTCApi declares these in its implementation section, so they are not
   // visible here; promotion levels (2) are deliberately not turned into refs.
