@@ -1863,7 +1863,7 @@ begin
 
     // A dropped connection stops the run without committing, so the checkpoint never
     // marches past a gap. But a revision that is genuinely unfetchable must not block the
-    // other 44,000: it is recorded in metaailed.csv and reported at the end, so it is
+    // other 44,000: it is recorded in meta\failed.csv and reported at the end, so it is
     // visible rather than silently missing.
     if FConnLost then
     begin
@@ -1899,7 +1899,7 @@ begin
   if FFailedRows.Count > 0 then
   begin
     Log('');
-    Log(Format('*** %d revision(s) COULD NOT BE FETCHED - see metaailed.csv ***',
+    Log(Format('*** %d revision(s) COULD NOT BE FETCHED - see meta\failed.csv ***',
       [FFailedRows.Count]));
     Log('*** The history is complete apart from those. ***');
   end;
