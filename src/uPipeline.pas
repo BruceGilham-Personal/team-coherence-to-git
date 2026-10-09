@@ -88,6 +88,9 @@ type
     procedure WriteCheckpoint(Index: Integer; const Extra: string);
     procedure LoadBlobManifest;
     procedure RewindToCheckpointTip;
+    function BlobIndex: TObjectDictionary<string, TList<Integer>>;
+    function EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
+      var Mark: Integer): Boolean;
     procedure FetchRange(StartIdx, EndIdx: Integer);
     function ClaimNext: Integer;
     function PendingCount: Integer;
@@ -864,6 +867,72 @@ type
     Path, Sha: string;
   end;
 
+// fast-import is a byte stream, not a text file: a blob is 'data <count>' followed by exactly
+// that many raw bytes. Anything that re-encodes would corrupt every binary file (and every
+// DFM), so commands are written as UTF-8 bytes and blob content is copied raw.
+procedure PutLine(FS: TStream; const Line: string);
+var
+  B: TBytes;
+begin
+  B := TEncoding.UTF8.GetBytes(Line + #10);
+  FS.WriteBuffer(B[0], Length(B));
+end;
+
+function TPipeline.EmitBlob(FS: TStream; const B: TBlob; Marks: TDictionary<string, Integer>;
+  var Mark: Integer): Boolean;
+// Writes B's content into the stream under a new mark, once per stream. False when the cached
+// file is missing, so the caller leaves that path out instead of referencing a mark that does
+// not exist.
+var
+  CacheFile: string;
+  Src: TFileStream;
+  LF: Byte;
+begin
+  if Marks.ContainsKey(B.Sha) then Exit(True);
+  CacheFile := TPath.Combine(FOpt.CacheDir,
+    StringReplace(B.CachePath, '/', PathDelim, [rfReplaceAll]));
+  if not TFile.Exists(CacheFile) then
+  begin
+    Log('  missing cached blob: ' + B.CachePath);
+    Exit(False);
+  end;
+  Inc(Mark);
+  Marks.Add(B.Sha, Mark);
+  PutLine(FS, 'blob');
+  PutLine(FS, 'mark :' + IntToStr(Mark));
+  Src := TFileStream.Create(CacheFile, fmOpenRead or fmShareDenyWrite);
+  try
+    PutLine(FS, 'data ' + IntToStr(Src.Size));
+    FS.CopyFrom(Src, 0);
+  finally
+    Src.Free;
+  end;
+  LF := 10;
+  FS.WriteBuffer(LF, 1);
+  Result := True;
+end;
+
+function TPipeline.BlobIndex: TObjectDictionary<string, TList<Integer>>;
+// 'fileid|revision' -> indices into FBlobs. Scanning every blob for every revision is
+// quadratic in the size of the history.
+var
+  I: Integer;
+  Key: string;
+  Lst: TList<Integer>;
+begin
+  Result := TObjectDictionary<string, TList<Integer>>.Create([doOwnsValues]);
+  for I := 0 to FBlobs.Count - 1 do
+  begin
+    Key := Format('%d|%s', [FBlobs[I].FileID, FBlobs[I].Revision]);
+    if not Result.TryGetValue(Key, Lst) then
+    begin
+      Lst := TList<Integer>.Create;
+      Result.Add(Key, Lst);
+    end;
+    Lst.Add(I);
+  end;
+end;
+
 // ---------------------------------------------------------------- connection heartbeat
 //
 // Watches the link and PAUSES fetching while it is down, instead of letting every revision
@@ -1561,6 +1630,7 @@ var
   // path, so a group must never contain two revisions of the same file - see the split rule
   // in the grouping loop below.
   GroupFiles: TDictionary<Cardinal, Boolean>;
+  Index: TObjectDictionary<string, TList<Integer>>;
   Chg: TChange;
   I, Mark, CommitCount, Rc: Integer;
   GroupAuthor, GroupComment, Msg, Out1: string;
@@ -1568,56 +1638,21 @@ var
   FirstCommit, BranchExists: Boolean;
 
   procedure Put(const Line: string);
-  var
-    B: TBytes;
   begin
-    B := TEncoding.UTF8.GetBytes(Line + #10);
-    FS.WriteBuffer(B[0], Length(B));
-  end;
-
-  procedure PutFileBytes(const FileName: string);
-  var
-    Src: TFileStream;
-    LF: Byte;
-  begin
-    Src := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
-    try
-      FS.CopyFrom(Src, 0);
-    finally
-      Src.Free;
-    end;
-    LF := 10;
-    FS.WriteBuffer(LF, 1);
+    PutLine(FS, Line);
   end;
 
   procedure EmitBlobsFor(const Rev: TTCRevision);
   var
     N: Integer;
-    Bl: TBlob;
-    CacheFile: string;
+    Lst: TList<Integer>;
   begin
-    for N := 0 to FBlobs.Count - 1 do
+    if not Index.TryGetValue(Format('%d|%s', [Rev.FileID, Rev.Revision]), Lst) then Exit;
+    for N in Lst do
     begin
-      Bl := FBlobs[N];
-      if (Bl.FileID <> Rev.FileID) or (Bl.Revision <> Rev.Revision) then Continue;
-      if not Marks.ContainsKey(Bl.Sha) then
-      begin
-        CacheFile := TPath.Combine(FOpt.CacheDir,
-          StringReplace(Bl.CachePath, '/', PathDelim, [rfReplaceAll]));
-        if not TFile.Exists(CacheFile) then
-        begin
-          Log('  missing cached blob: ' + Bl.CachePath);
-          Continue;
-        end;
-        Inc(Mark);
-        Marks.Add(Bl.Sha, Mark);
-        Put('blob');
-        Put('mark :' + IntToStr(Mark));
-        Put('data ' + IntToStr(TFile.GetSize(CacheFile)));
-        PutFileBytes(CacheFile);
-      end;
-      Chg.Path := MemberPath(Rev.TCPath, Bl.Member);
-      Chg.Sha := Bl.Sha;
+      if not EmitBlob(FS, FBlobs[N], Marks, Mark) then Continue;
+      Chg.Path := MemberPath(Rev.TCPath, FBlobs[N].Member);
+      Chg.Sha := FBlobs[N].Sha;
       Pending.Add(Chg);
     end;
   end;
@@ -1654,6 +1689,7 @@ begin
   Marks := TDictionary<string, Integer>.Create;
   Pending := TList<TChange>.Create;
   GroupFiles := TDictionary<Cardinal, Boolean>.Create;
+  Index := BlobIndex;
   try
     GitIn := 0;
     if not StartFastImport(GitProc, GitIn) then
@@ -1707,6 +1743,7 @@ begin
     end;
     Item(Format('imported %d commits', [CommitCount]));
   finally
+    Index.Free;
     Marks.Free;
     Pending.Free;
     GroupFiles.Free;
@@ -1760,7 +1797,7 @@ var
   BlobsAt: TObjectDictionary<string, TList<Integer>>; // 'fileid|revision' -> FBlobs indices
   Lst: TList<Integer>;
   I, J, N, Mark, TagCount, Emitted: Integer;
-  Key, Ep, Msg, Out1, CacheFile: string;
+  Key, Ep, Msg, Out1: string;
   // one entry per path in this label's tree, as sha + TAB + path. Not a name=value list: git
   // paths here contain spaces and could contain '=', but never a tab.
   Paths: TStringList;
@@ -1768,11 +1805,8 @@ var
   UsedRefs: TDictionary<string, Boolean>;
 
   procedure Put(const Line: string);
-  var
-    B: TBytes;
   begin
-    B := TEncoding.UTF8.GetBytes(Line + #10);
-    FS.WriteBuffer(B[0], Length(B));
+    PutLine(FS, Line);
   end;
 
 begin
@@ -1793,7 +1827,7 @@ begin
 
   Marks := TDictionary<string, Integer>.Create;
   RevPath := TDictionary<string, string>.Create;
-  BlobsAt := TObjectDictionary<string, TList<Integer>>.Create([doOwnsValues]);
+  BlobsAt := BlobIndex;
   Paths := TStringList.Create;
   UsedRefs := TDictionary<string, Boolean>.Create;
   try
@@ -1801,17 +1835,6 @@ begin
       RevPath.AddOrSetValue(
         Format('%d|%s', [FSession.Revisions[I].FileID, FSession.Revisions[I].Revision]),
         FSession.Revisions[I].TCPath);
-
-    for I := 0 to FBlobs.Count - 1 do
-    begin
-      Key := Format('%d|%s', [FBlobs[I].FileID, FBlobs[I].Revision]);
-      if not BlobsAt.TryGetValue(Key, Lst) then
-      begin
-        Lst := TList<Integer>.Create;
-        BlobsAt.Add(Key, Lst);
-      end;
-      Lst.Add(I);
-    end;
 
     Log(Format('Rebuilding %d label(s) from %d attachment(s)...',
       [FSession.Labels.Count, FSession.Attachments.Count]));
@@ -1839,26 +1862,7 @@ begin
           if not RevPath.ContainsKey(Key) then Continue;
           for N := 0 to Lst.Count - 1 do
           begin
-            if not Marks.ContainsKey(FBlobs[Lst[N]].Sha) then
-            begin
-              CacheFile := TPath.Combine(FOpt.CacheDir,
-                StringReplace(FBlobs[Lst[N]].CachePath, '/', PathDelim, [rfReplaceAll]));
-              if not TFile.Exists(CacheFile) then Continue;
-              Inc(Mark);
-              Marks.Add(FBlobs[Lst[N]].Sha, Mark);
-              Put('blob');
-              Put('mark :' + IntToStr(Mark));
-              Put('data ' + IntToStr(TFile.GetSize(CacheFile)));
-              // blob bytes must go out raw - a text writer would corrupt every binary
-              var Src := TFileStream.Create(CacheFile, fmOpenRead or fmShareDenyWrite);
-              try
-                FS.CopyFrom(Src, 0);
-              finally
-                Src.Free;
-              end;
-              var LF: Byte := 10;
-              FS.WriteBuffer(LF, 1);
-            end;
+            if not EmitBlob(FS, FBlobs[Lst[N]], Marks, Mark) then Continue;
             Paths.Add(FBlobs[Lst[N]].Sha + #9 + MemberPath(RevPath[Key], FBlobs[Lst[N]].Member));
             Inc(Emitted);
           end;
