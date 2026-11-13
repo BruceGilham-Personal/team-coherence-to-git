@@ -28,7 +28,10 @@ Every one of those comments describes something that actually happened.
 - **Verified** — reconciles revisions against fetched content, runs `git fsck`, and checks every
   archive's fetched size against the size TC recorded for that revision
 - **Updatable** — `--update` adds later TC check-ins on top of the published branch, after
-  checking that every file at its tip is the content TC has for it, and `--push` publishes them
+  checking that every file at its tip is the content TC has for it, and `--push` publishes them,
+  in steps when the history is over GitHub's 2 GB push limit
+- **Release branches** — `--release-branches` keeps a `release/<label>` branch per version
+  label, chained so a fix made on an old release merges forward through every newer one
 
 ## Requirements
 
@@ -79,9 +82,10 @@ Used successfully for one large migration. Not widely tested — expect to read 
 - Commit SHAs are not reproducible across runs (committer timestamps), so compare **trees**
 - Some revisions may be unrecoverable: this repository had 6 that failed identically through two
   independent access paths, which is TC's storage being damaged rather than a tool problem
-- Windows only, and Win32 only, because the TC client DLLs are
+- Windows only, and Win32 only, because the TC client DLLs are 32-bit
 - Updates are one-way: TC to git. A commit made directly on the mirrored branch stops them
-- Update mode has not yet been run against a live Team Coherence server
+- Update mode has been run against a live Team Coherence server only on the one repository
+  migrated so far
 
 ## Licence
 

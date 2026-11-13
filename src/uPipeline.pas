@@ -60,6 +60,15 @@ type
     // Paths never written to git, as ';'-separated masks matched against the file name, e.g.
     // '*.pfx' for a history that had its certificates removed.
     Exclude: string;
+    // The URL for Remote. When the repository has no such remote it is added; when it has one
+    // with a different URL the run refuses rather than repoint it. '' = use what is configured.
+    RemoteUrl: string;
+    // Keep a release/<label> branch for every version label, chained oldest to newest so a fix
+    // merged forward carries only itself. See UpdateReleaseBranches.
+    ReleaseBranches: Boolean;
+    // ';'-separated masks of labels that get no release branch, e.g. the label on the version
+    // still being built, which is the branch itself.
+    ReleaseSkip: string;
   end;
 
   // A state that needs a person to look at it, not a retry: the supervisor stops on it.
@@ -122,7 +131,19 @@ type
     FExcludes: TArray<string>;
     FLfsPatterns: TArray<TRegEx>;              // from .gitattributes: paths stored in LFS
     FAttrBlob: string;                         // git id of the tip's .gitattributes, if any
+    // ---- labels attached to the branch, release branches -------------------------------
+    FBranchShas: TArray<string>;               // the branch's first-parent line, newest first
+    FBranchTimes: TArray<Int64>;               // ... and each commit's author time (Unix)
+    FReleasePush: TStringList;                 // release branches safe to push this run
     function Excluded(const Path: string): Boolean;
+    function TreeOf(const Rev: string): string;
+    function AttachPoint(NewestUtc: TDateTime): string;
+    function LabelParent(const TagRef: string; NewestUtc: TDateTime): string;
+    function CommitTree(const Tree: string; const Parents: array of string;
+      const Msg, Name, Email, RawDate: string): string;
+    procedure ReattachTag(const TagRef: string; NewestUtc: TDateTime);
+    procedure EnsureRemote;
+    procedure PushBranchInSteps(const Branch: string);
     function IsLfsPath(const Path: string): Boolean;
     procedure LoadLfsPatterns(const Commit: string);
     procedure PrepareFiltered(const Shas: TArray<string>);
@@ -206,6 +227,7 @@ type
     procedure PrepareLabelCarryOver;
     procedure FollowMovedFiles;
     procedure RunUpdate;
+    procedure UpdateReleaseBranches;
     procedure PushToRemote;
     property Blobs: TList<TBlob> read FBlobs;
   end;
@@ -213,7 +235,7 @@ type
 implementation
 
 uses
-  System.Hash, System.IOUtils, System.DateUtils, System.StrUtils,
+  System.Hash, System.IOUtils, System.DateUtils, System.StrUtils, System.Math,
   System.Generics.Defaults, System.Masks;
 
 constructor TPipeline.Create(ASession: TTCSession; const AOpt: TPipelineOptions);
@@ -236,10 +258,12 @@ begin
   FTree := TDictionary<string, TTreeEntry>.Create;
   FFiltered := TDictionary<string, string>.Create;
   FExcludes := FOpt.Exclude.Split([';'], TStringSplitOptions.ExcludeEmpty);
+  FReleasePush := TStringList.Create;
 end;
 
 destructor TPipeline.Destroy;
 begin
+  FReleasePush.Free;
   FFiltered.Free;
   FLedger.Free;
   FLedgerNew.Free;
@@ -2231,8 +2255,14 @@ procedure TPipeline.ImportTags;
 // A TC version label is not a pointer to a check-in - it is a list of (file, revision) pairs,
 // which can mix revisions from any point in history and need not correspond to any commit that
 // ever existed on the trunk. So a label cannot honestly be a git tag pointing at a trunk
-// commit: it is emitted as a root commit with `deleteall` plus exactly the labelled revisions,
-// on refs/tags/<name>.
+// commit: it is emitted as its own commit with `deleteall` plus exactly the labelled
+// revisions, on refs/tags/<name>.
+//
+// That commit's PARENT is a commit on the branch - see LabelParent. The parent says nothing
+// about the label's content, which is the tree alone; it gives the label history in common
+// with the branch. A label written as a root commit shares no history with anything, so a
+// branch started from it can never be merged with another usefully: git has no common base and
+// every file conflicts. That is what release branches (UpdateReleaseBranches) are built on.
 //
 // This work once lived in a whole-repository import that nothing called, so every run that
 // passed --tags enumerated 44,450 attachments and then created no refs whatsoever. The lookups
@@ -2261,10 +2291,31 @@ var
   HasLfs: Boolean;
   NowLabels: TArray<TTCLabel>;
   NowAttach: TArray<TTCAttachment>;
+  RevWhen: TDictionary<string, TDateTime>;            // 'fileid|revision' -> check-in, UTC
+  Loose: TStringList;                                 // unchanged tags with no parent
+  Newest, W: TDateTime;
+  Parent: string;
 
   procedure Put(const Line: string);
   begin
     PutLine(FS, Line);
+  end;
+
+  // the latest check-in among the revisions a label holds content for
+  function NewestOf(LabelID: Cardinal): TDateTime;
+  var
+    K: Integer;
+    Key2: string;
+    L2: TList<Integer>;
+  begin
+    Result := 0;
+    for K := 0 to FSession.Attachments.Count - 1 do
+    begin
+      if FSession.Attachments[K].LabelID <> LabelID then Continue;
+      Key2 := Format('%d|%s', [FSession.Attachments[K].FileID, FSession.Attachments[K].Revision]);
+      if not BlobsAt.TryGetValue(Key2, L2) then Continue;
+      if RevWhen.TryGetValue(Key2, W) and (W > Result) then Result := W;
+    end;
   end;
 
 begin
@@ -2288,11 +2339,15 @@ begin
   BlobsAt := BlobIndex;
   Paths := TStringList.Create;
   UsedRefs := TDictionary<string, Boolean>.Create;
+  RevWhen := TDictionary<string, TDateTime>.Create;
+  Loose := TStringList.Create;
   try
     for I := 0 to FSession.Revisions.Count - 1 do
-      RevPath.AddOrSetValue(
-        Format('%d|%s', [FSession.Revisions[I].FileID, FSession.Revisions[I].Revision]),
-        FSession.Revisions[I].TCPath);
+    begin
+      Key := Format('%d|%s', [FSession.Revisions[I].FileID, FSession.Revisions[I].Revision]);
+      RevPath.AddOrSetValue(Key, FSession.Revisions[I].TCPath);
+      RevWhen.AddOrSetValue(Key, FSession.Revisions[I].When);
+    end;
 
     // ---- which labels to (re)build, and under which ref -----------------------------------
     // Tags, not branches under the branch. 'refs/heads/tc/main/label/x' cannot exist while
@@ -2331,6 +2386,9 @@ begin
          (RefSha(Ep) <> '') then
       begin
         Inc(Unchanged);
+        // an unchanged tag written as a root commit, by an earlier version of this tool, is
+        // given a parent; its tree stays exactly as published
+        if RefSha(Ep + '^1') = '' then Loose.AddObject(Ep, TObject(NativeUInt(FSession.Labels[I].ID)));
         Continue;
       end;
       Refs[I] := Ep;
@@ -2399,11 +2457,13 @@ begin
         Msg := FSession.Labels[I].Name;
         if Trim(FSession.Labels[I].Comment) <> '' then
           Msg := Msg + #10#10 + FSession.Labels[I].Comment;
+        Parent := LabelParent(Ep, NewestOf(FSession.Labels[I].ID));
         Put('commit ' + Ep);
         Put(Format('committer %s %s',
           [MapAuthor('tc'), GitStamp(FSession.Labels[I].When)]));
         Put('data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
         Put(Msg);
+        if Parent <> '' then Put('from ' + Parent);
         Put('deleteall');   // a label defines the whole tree, not a delta
         for J := 0 to Paths.Count - 1 do
         begin
@@ -2431,6 +2491,12 @@ begin
     Log(Format('%d label(s) written as tags under refs/tags/. List them with: git tag',
       [TagCount]));
 
+    for I := 0 to Loose.Count - 1 do
+    begin
+      if Cancelled then Break;
+      ReattachTag(Loose[I], NewestOf(Cardinal(NativeUInt(Loose.Objects[I]))));
+    end;
+
     // A label deleted in TC leaves its tag behind. Deleting a published tag is a decision for
     // a person, so they are listed rather than removed.
     if GitOut('for-each-ref --format=%(refname) refs/tags/', Out1) = 0 then
@@ -2443,12 +2509,134 @@ begin
           [Paths.Count, string.Join(', ', Paths.ToStringArray)]));
     end;
   finally
+    Loose.Free;
+    RevWhen.Free;
     Paths.Free;
     UsedRefs.Free;
     BlobsAt.Free;
     RevPath.Free;
     Marks.Free;
   end;
+end;
+
+// ---------------------------------------------------------------- labels on the branch
+//
+// Where a label commit hangs. Its content is its tree; the parent only gives it history in
+// common with the branch, which is what lets release branches built from labels be merged.
+
+function TPipeline.TreeOf(const Rev: string): string;
+begin
+  if GitOut('rev-parse --verify --quiet ' + Rev + '^{tree}', Result) <> 0 then Result := '';
+  Result := Trim(Result);
+end;
+
+function TPipeline.AttachPoint(NewestUtc: TDateTime): string;
+// The newest commit on the branch checked in no later than the newest revision the label
+// holds: the earliest point at which every file in the label existed. '' when the branch has
+// no commits.
+var
+  Out1, Line: string;
+  Parts: TArray<string>;
+  L: TList<string>;
+  T: TList<Int64>;
+  I: Integer;
+  At: Int64;
+begin
+  if Length(FBranchShas) = 0 then
+  begin
+    L := TList<string>.Create;
+    T := TList<Int64>.Create;
+    try
+      if GitOut(Format('log --first-parent --format=%%H%%x09%%at refs/heads/%s', [FOpt.Branch]),
+                Out1, 600) = 0 then
+        for Line in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+        begin
+          Parts := Trim(Line).Split([#9]);
+          if (Length(Parts) = 2) and (Length(Parts[0]) = 40) then
+          begin
+            L.Add(Parts[0]);
+            T.Add(StrToInt64Def(Parts[1], 0));
+          end;
+        end;
+      FBranchShas := L.ToArray;
+      FBranchTimes := T.ToArray;
+    finally
+      L.Free;
+      T.Free;
+    end;
+  end;
+  if Length(FBranchShas) = 0 then Exit('');
+  At := DateTimeToUnix(NewestUtc, True);
+  // newest first: the first commit not after the label's newest revision
+  for I := 0 to High(FBranchShas) do
+    if FBranchTimes[I] <= At then Exit(FBranchShas[I]);
+  Result := FBranchShas[High(FBranchShas)];   // older than the whole branch: its first commit
+end;
+
+function TPipeline.LabelParent(const TagRef: string; NewestUtc: TDateTime): string;
+// A label already published keeps the parent it has - the tag moves, its place on the branch
+// does not - as long as that parent is on the branch. Otherwise it is attached by AttachPoint.
+var
+  Old: string;
+begin
+  Old := RefSha(TagRef + '^1');
+  if (Old <> '') and IsAncestor(Old, 'refs/heads/' + FOpt.Branch) then Exit(Old);
+  Result := AttachPoint(NewestUtc);
+end;
+
+function TPipeline.CommitTree(const Tree: string; const Parents: array of string;
+  const Msg, Name, Email, RawDate: string): string;
+// A commit made without a work tree: git commit-tree, identity and date given explicitly so the
+// result does not depend on who runs it or when. The message goes through a file on stdin,
+// because a command line cannot carry its newlines.
+const
+  Vars: array[0..5] of string = ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+    'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE');
+var
+  Args, MsgFile, Out1: string;
+  P: string;
+  V: string;
+begin
+  Args := 'commit-tree ' + Tree;
+  for P in Parents do Args := Args + ' -p ' + P;
+  MsgFile := TPath.Combine(FOpt.MetaDir, 'commit-msg.tmp');
+  TFile.WriteAllBytes(MsgFile, TEncoding.UTF8.GetBytes(Msg));   // no BOM: git would keep it
+  SetEnvironmentVariable('GIT_AUTHOR_NAME', PChar(Name));
+  SetEnvironmentVariable('GIT_AUTHOR_EMAIL', PChar(Email));
+  SetEnvironmentVariable('GIT_AUTHOR_DATE', PChar(RawDate));
+  SetEnvironmentVariable('GIT_COMMITTER_NAME', PChar(Name));
+  SetEnvironmentVariable('GIT_COMMITTER_EMAIL', PChar(Email));
+  SetEnvironmentVariable('GIT_COMMITTER_DATE', PChar(RawDate));
+  try
+    if RunProcess(FOpt.GitExe, Args, FOpt.RepoDir, Out1, MsgFile, True) <> 0 then
+      raise Exception.Create('git commit-tree failed: ' + Trim(Out1));
+  finally
+    for V in Vars do SetEnvironmentVariable(PChar(V), nil);
+    TFile.Delete(MsgFile);
+  end;
+  Result := Trim(Out1);
+  if Length(Result) <> 40 then
+    raise Exception.Create('git commit-tree returned no commit: ' + Result);
+end;
+
+procedure TPipeline.ReattachTag(const TagRef: string; NewestUtc: TDateTime);
+// Gives a parentless tag a parent on the branch: the same tree, message, identity and date.
+var
+  Old, Parent, Out1, New: string;
+  Id: TArray<string>;
+begin
+  Old := RefSha(TagRef);
+  Parent := AttachPoint(NewestUtc);
+  if (Old = '') or (Parent = '') then Exit;
+  if (GitOut('log -1 --date=raw --format=%cn%x09%ce%x09%cd ' + Old, Out1) <> 0) then Exit;
+  Id := Trim(Out1).Split([#9]);
+  if Length(Id) <> 3 then Exit;
+  if GitOut('log -1 --format=%B ' + Old, Out1) <> 0 then Exit;
+  New := CommitTree(TreeOf(Old), [Parent], TrimRight(Out1) + #10, Id[0], Id[1], Id[2]);
+  if GitOut(Format('update-ref %s %s %s', [TagRef, New, Old]), Out1) <> 0 then
+    raise Exception.Create('Could not move ' + TagRef + ': ' + Trim(Out1));
+  Log(Format('  %s attached to %s at %s (its files are unchanged)',
+    [TagRef, FOpt.Branch, Copy(Parent, 1, 8)]));
 end;
 
 procedure TPipeline.RemoveDeletedFiles;
@@ -3136,6 +3324,7 @@ begin
   end;
 
   // The remote holds the published history, and an update builds only on that.
+  EnsureRemote;
   if RemoteExists then
   begin
     Log(Format('Checking %s on %s...', [FOpt.Branch, FOpt.Remote]));
@@ -3496,14 +3685,409 @@ begin
     Log(Format('Added %d revision(s) from Team Coherence.', [Total]));
 end;
 
-procedure TPipeline.PushToRemote;
-// The branch is pushed WITHOUT force: the update checked the remote is at or behind this
-// repository, so a rejection means someone pushed in the meantime - a reason to stop, never to
-// overwrite. Tags are pushed with force, because a label re-applied in TC moves its tag.
+// ---------------------------------------------------------------- release branches
+//
+// One branch per version label, release/<label>, for fixing a released version in git and
+// carrying the fix forward: commit it on the oldest release it applies to, then merge each
+// release branch into the next.
+//
+// A label commit is a whole snapshot. Merged as it is, release/v5 into release/v6 would carry
+// every difference between the two snapshots, putting v5's files into v6. So each branch after
+// the first records, once, that it already includes the one before - a merge that changes no
+// file. After that a merge forward brings only what was committed on the older branch since.
+//
+// The branches belong to the people fixing releases; tc2git only starts them and keeps them
+// in step with Team Coherence, and never forces one:
+//   - a new label gets its branch, recorded as including the previous release
+//   - a label re-applied in TC moves its branch forward with one commit holding the label's
+//     new tree - but only while nobody has committed to that branch in git. Otherwise the
+//     branch is left alone and listed in meta\release_behind.csv for a person to reconcile.
+//   - what TC changes is never merged forward: each label's own re-application is what
+//     carries a TC fix to that version, so the next branch records it as included.
+// meta\release_branches.csv remembers, per branch, the label commit and the tip tc2git last
+// wrote; a tip that differs means someone has committed there.
+
+const
+  ReleasePrefix = 'release/';
+  ZeroSha = '0000000000000000000000000000000000000000';
+
+function StrCmpLogicalW(psz1, psz2: PWideChar): Integer; stdcall;
+  external 'shlwapi.dll' name 'StrCmpLogicalW';
+
+function CompareVersions(const A, B: string): Integer;
+// v1.7 < v1.7.01 < v1.8.01 < v4.0.0 < v4.0.0_GA < v4.0.0_HF1 < v4.0.0_HF7 < v4.1.0 < V4.2.0:
+// the numbers compared as numbers, then whatever follows them in natural order, none first.
+  procedure Split(const S: string; out Nums: TArray<Integer>; out Rest: string);
+  var
+    I: Integer;
+    Head: string;
+    Parts: TArray<string>;
+  begin
+    I := 2;   // after the leading v
+    while (I <= Length(S)) and CharInSet(S[I], ['0'..'9', '.']) do Inc(I);
+    Head := Copy(S, 2, I - 2);
+    while Head.EndsWith('.') do Head := Copy(Head, 1, Length(Head) - 1);
+    Rest := Copy(S, I, MaxInt);
+    Parts := Head.Split(['.'], TStringSplitOptions.ExcludeEmpty);
+    SetLength(Nums, Length(Parts));
+    for I := 0 to High(Parts) do Nums[I] := StrToIntDef(Parts[I], 0);
+  end;
+var
+  NA, NB: TArray<Integer>;
+  RA, RB: string;
+  I: Integer;
+begin
+  Split(A, NA, RA);
+  Split(B, NB, RB);
+  for I := 0 to Min(High(NA), High(NB)) do
+    if NA[I] <> NB[I] then Exit(NA[I] - NB[I]);
+  if Length(NA) <> Length(NB) then Exit(Length(NA) - Length(NB));
+  if (RA = '') or (RB = '') then Exit(Ord(RA <> '') - Ord(RB <> ''));
+  Result := StrCmpLogicalW(PWideChar(RA), PWideChar(RB));
+end;
+
+procedure TPipeline.UpdateReleaseBranches;
+type
+  TRel = record
+    Name, Branch, Tag, Tip, StateTag, StateTip: string;
+    Managed: Boolean;
+  end;
+var
+  Out1, Line, Remote, New, Msg: string;
+  Names: TList<string>;
+  Rels: TArray<TRel>;
+  State: TDictionary<string, TArray<string>>;
+  Diverged: TDictionary<string, Boolean>;
+  Behind, Rows: TStringList;
+  Parts: TArray<string>;
+  Skips: TArray<string>;
+  Mask: string;
+  I, Prev, Created, Advanced, Recorded: Integer;
+  Skip: Boolean;
+  Id: TArray<string>;
+
+  function StatePathRel: string;
+  begin
+    Result := TPath.Combine(FOpt.MetaDir, 'release_branches.csv');
+  end;
+
+  procedure MoveBranch(var R: TRel; const NewTip: string; Owned: Boolean);
+  var
+    O: string;
+  begin
+    if GitOut(Format('update-ref refs/heads/%s %s %s', [R.Branch, NewTip,
+              IfThen(R.Tip = '', ZeroSha, R.Tip)]), O) <> 0 then
+      raise Exception.Create('Could not move ' + R.Branch + ': ' + Trim(O));
+    R.Tip := NewTip;
+    if Owned then R.StateTip := NewTip;
+  end;
+
+  // identity and date of a label commit, for the commits made on its branch
+  function LabelIdent(const Commit: string): TArray<string>;
+  var
+    O: string;
+  begin
+    Result := nil;
+    if GitOut('log -1 --date=raw --format=%cn%x09%ce%x09%cd ' + Commit, O) = 0 then
+      Result := Trim(O).Split([#9]);
+    if Length(Result) <> 3 then
+      raise Exception.Create('Cannot read the label commit ' + Commit);
+  end;
+
+begin
+  if not FOpt.IncludeTags then
+    raise EUpdateRefused.Create('Release branches are built from the version labels: they ' +
+      'need --tags as well.');
+  FReleasePush.Clear;
+  Skips := FOpt.ReleaseSkip.Split([';'], TStringSplitOptions.ExcludeEmpty);
+
+  // ---- which labels get a branch, oldest version first --------------------------------
+  Names := TList<string>.Create;
+  State := TDictionary<string, TArray<string>>.Create;
+  Diverged := TDictionary<string, Boolean>.Create;
+  Behind := TStringList.Create;
+  Rows := TStringList.Create;
+  try
+    if GitOut('for-each-ref --format=%(refname:short) refs/tags/', Out1) <> 0 then
+      raise Exception.Create('Could not list the tags: ' + Trim(Out1));
+    for Line in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+    begin
+      if not TRegEx.IsMatch(Trim(Line), '^[vV][0-9]') then Continue;   // not a version
+      Skip := False;
+      for Mask in Skips do
+        if MatchesMask(Trim(Line), Mask) then Skip := True;
+      if not Skip then Names.Add(Trim(Line));
+    end;
+    Names.Sort(TComparer<string>.Construct(
+      function(const A, B: string): Integer
+      begin
+        Result := CompareVersions(A, B);
+        if Result = 0 then Result := CompareStr(A, B);
+      end));
+    if Names.Count = 0 then
+    begin
+      Log('No version labels to make release branches from.');
+      Exit;
+    end;
+
+    if TFile.Exists(StatePathRel) then
+      for Line in TFile.ReadAllLines(StatePathRel, TEncoding.UTF8) do
+      begin
+        Parts := Line.Trim([#$FEFF, ' ', #9]).Split([',']);
+        if (Length(Parts) = 3) and (Length(Parts[1]) = 40) then
+          State.AddOrSetValue(Parts[0], [Parts[1], Parts[2]]);
+      end;
+
+    // ---- what people pushed: fixes are committed on the remote, not here -----------------
+    EnsureRemote;
+    if RemoteExists then
+    begin
+      Log(Format('Fetching %s* from %s...', [ReleasePrefix, FOpt.Remote]));
+      if GitOut(Format('fetch --no-tags %s +refs/heads/%s*:refs/remotes/%s/%s*',
+                [FOpt.Remote, ReleasePrefix, FOpt.Remote, ReleasePrefix]), Out1, 3600) <> 0 then
+        raise Exception.Create('git fetch of the release branches failed: ' +
+          Copy(Trim(Out1), 1, 300));
+    end;
+
+    SetLength(Rels, Names.Count);
+    for I := 0 to Names.Count - 1 do
+    begin
+      Rels[I].Name := Names[I];
+      Rels[I].Branch := ReleasePrefix + Names[I];
+      Rels[I].Tag := RefSha('refs/tags/' + Names[I]);
+      Rels[I].Tip := RefSha('refs/heads/' + Rels[I].Branch);
+      Rels[I].Managed := True;
+      if State.ContainsKey(Names[I]) then
+      begin
+        Rels[I].StateTag := State[Names[I]][0];
+        Rels[I].StateTip := State[Names[I]][1];
+      end;
+      if RemoteExists then
+      begin
+        Remote := RefSha(Format('refs/remotes/%s/%s', [FOpt.Remote, Rels[I].Branch]));
+        if (Remote <> '') and (Remote <> Rels[I].Tip) then
+          if (Rels[I].Tip = '') or IsAncestor(Rels[I].Tip, Remote) then
+          begin
+            MoveBranch(Rels[I], Remote, False);   // someone's commits: theirs, not ours
+            Log(Format('  %s: brought up to %s from %s', [Rels[I].Branch, Copy(Remote, 1, 8),
+              FOpt.Remote]));
+          end
+          else if not IsAncestor(Remote, Rels[I].Tip) then
+          begin
+            Log(Format('*** %s here and on %s have both changed; it is left alone this run. ' +
+              'Reconcile them by hand.', [Rels[I].Branch, FOpt.Remote]));
+            Rels[I].Managed := False;
+            Diverged.Add(Rels[I].Name, True);
+          end;
+      end;
+    end;
+
+    // ---- each branch exists and holds its label --------------------------------------------
+    Created := 0;
+    Advanced := 0;
+    for I := 0 to High(Rels) do
+    begin
+      if not Rels[I].Managed then Continue;
+      if Rels[I].Tip = '' then
+      begin
+        MoveBranch(Rels[I], Rels[I].Tag, True);
+        Rels[I].StateTag := Rels[I].Tag;
+        Inc(Created);
+        Log(Format('  %s created from %s', [Rels[I].Branch, Rels[I].Name]));
+      end
+      else if Rels[I].StateTip = '' then
+      begin
+        // a branch tc2git did not make: taken on only if it holds exactly the label
+        if TreeOf(Rels[I].Tip) = TreeOf(Rels[I].Tag) then
+        begin
+          Rels[I].StateTag := Rels[I].Tag;
+          Rels[I].StateTip := Rels[I].Tip;
+          Log(Format('  %s already holds %s; kept up to date from now on',
+            [Rels[I].Branch, Rels[I].Name]));
+        end
+        else
+        begin
+          Log(Format('*** %s exists but does not hold label %s, and tc2git did not make it. ' +
+            'Left alone.', [Rels[I].Branch, Rels[I].Name]));
+          Rels[I].Managed := False;
+        end;
+      end
+      else if TreeOf(Rels[I].Tag) <> TreeOf(Rels[I].StateTip) then
+      begin
+        // the label's files changed in TC since tc2git last wrote this branch
+        if TreeOf(Rels[I].Tip) = TreeOf(Rels[I].Tag) then
+        begin
+          Rels[I].StateTag := Rels[I].Tag;   // someone already brought them in
+          Rels[I].StateTip := Rels[I].Tip;
+        end
+        else if Rels[I].Tip = Rels[I].StateTip then
+        begin
+          Id := LabelIdent(Rels[I].Tag);
+          New := CommitTree(TreeOf(Rels[I].Tag), [Rels[I].Tip],
+            Format('%s re-applied in Team Coherence'#10#10 +
+              'The files of label %s as Team Coherence now has them.'#10,
+              [Rels[I].Name, Rels[I].Name]), 'tc2git', 'tc2git@localhost', Id[2]);
+          MoveBranch(Rels[I], New, True);
+          Rels[I].StateTag := Rels[I].Tag;
+          Inc(Advanced);
+          Log(Format('  %s moved forward: label %s was re-applied in TC',
+            [Rels[I].Branch, Rels[I].Name]));
+        end
+        else
+        begin
+          Log(Format('*** label %s was re-applied in TC, but %s has commits made in git ' +
+            'since. Not changed: bring the label''s changes in by hand (git diff %s %s).',
+            [Rels[I].Name, Rels[I].Branch, Rels[I].StateTip, Rels[I].Tag]));
+          Behind.Add(Format('%s,%s,%s,%s', [Rels[I].Branch, Rels[I].Tip, Rels[I].StateTip,
+            Rels[I].Tag]));
+        end;
+      end
+      else
+        Rels[I].StateTag := Rels[I].Tag;   // same files; the tag may have been re-attached
+    end;
+
+    // ---- each branch records the one before as included ------------------------------------
+    Recorded := 0;
+    Prev := -1;
+    for I := 0 to High(Rels) do
+    begin
+      if not Rels[I].Managed then Continue;
+      if (Prev >= 0) and not IsAncestor(Rels[Prev].StateTip, Rels[I].Tip) then
+      begin
+        Id := LabelIdent(Rels[I].Tag);
+        Msg := Format('Record that %s already includes %s'#10#10 +
+          'No files change. Later fixes merged from %s bring only themselves, not the %s ' +
+          'snapshot.'#10, [Rels[I].Name, Rels[Prev].Name, Rels[Prev].Branch, Rels[Prev].Name]);
+        New := CommitTree(TreeOf(Rels[I].Tip), [Rels[I].Tip, Rels[Prev].StateTip], Msg,
+          'tc2git', 'tc2git@localhost', Id[2]);
+        // a branch someone has committed to stays theirs: the record does not vouch for it
+        MoveBranch(Rels[I], New, Rels[I].Tip = Rels[I].StateTip);
+        Inc(Recorded);
+      end;
+      Prev := I;
+    end;
+
+    // ---- remember, report ---------------------------------------------------------------------
+    for I := 0 to High(Rels) do
+      if Rels[I].Managed then
+      begin
+        Rows.Add(Format('%s,%s,%s', [Rels[I].Name, Rels[I].StateTag, Rels[I].StateTip]));
+        FReleasePush.Add(Rels[I].Branch);
+      end
+      else if State.ContainsKey(Rels[I].Name) then
+        Rows.Add(Format('%s,%s,%s', [Rels[I].Name, State[Rels[I].Name][0],
+          State[Rels[I].Name][1]]));
+    // no BOM: it would become part of the first label's name when read back
+    TFile.WriteAllBytes(StatePathRel, TEncoding.UTF8.GetBytes(
+      string.Join(#13#10, Rows.ToStringArray) + #13#10));
+    if Behind.Count > 0 then
+    begin
+      Behind.Insert(0, 'branch,tip,tc2git_last_tip,label_commit');
+      Behind.SaveToFile(TPath.Combine(FOpt.MetaDir, 'release_behind.csv'), TEncoding.UTF8);
+    end
+    else if TFile.Exists(TPath.Combine(FOpt.MetaDir, 'release_behind.csv')) then
+      TFile.Delete(TPath.Combine(FOpt.MetaDir, 'release_behind.csv'));
+
+    // a release branch whose label is gone is somebody's decision, like a tag
+    if GitOut(Format('for-each-ref --format=%%(refname:short) refs/heads/%s', [ReleasePrefix]),
+              Out1) = 0 then
+      for Line in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+        if not Names.Contains(Copy(Trim(Line), Length(ReleasePrefix) + 1, MaxInt)) then
+          Log(Format('  %s matches no version label here and was left in place', [Trim(Line)]));
+
+    Log(Format('Release branches: %d, of which %d new, %d moved forward from TC, %d inclusion ' +
+      'record(s) added; %d left alone.', [FReleasePush.Count, Created, Advanced, Recorded,
+      Length(Rels) - FReleasePush.Count]));
+  finally
+    Rows.Free;
+    Behind.Free;
+    Diverged.Free;
+    State.Free;
+    Names.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------- remote
+
+procedure TPipeline.EnsureRemote;
+// --remote-url: add the remote when it is missing, refuse when it points somewhere else.
 var
   Out1: string;
 begin
+  if (FOpt.RemoteUrl = '') or (FOpt.Remote = '') then Exit;
+  if RemoteExists then
+  begin
+    GitOut('remote get-url ' + FOpt.Remote, Out1);
+    if not SameText(Trim(Out1), FOpt.RemoteUrl) then
+      raise EUpdateRefused.CreateFmt('Remote "%s" is %s, not %s. Change it yourself if that ' +
+        'is intended: git -C "%s" remote set-url %s <url>',
+        [FOpt.Remote, Trim(Out1), FOpt.RemoteUrl, FOpt.RepoDir, FOpt.Remote]);
+  end
+  else
+  begin
+    if GitOut(Format('remote add %s %s', [FOpt.Remote, FOpt.RemoteUrl]), Out1) <> 0 then
+      raise Exception.Create('Could not add the remote: ' + Trim(Out1));
+    Log(Format('Remote "%s" added: %s', [FOpt.Remote, FOpt.RemoteUrl]));
+  end;
+end;
+
+procedure TPipeline.PushBranchInSteps(const Branch: string);
+// GitHub refuses a push over 2 GB - after uploading it all, with a bare HTTP 500 - and a
+// repository's whole history can be more than that. So a branch far ahead of the remote goes
+// up in steps along its first-parent line, the remote branch moving forward with each; a step
+// that is refused is retried at half the size. Never forced.
+const
+  StepCommits = 2000;
+var
+  Out1, Remote, Range: string;
+  Commits: TArray<string>;
+  Done, Target, Step: Integer;
+begin
+  Remote := '';
+  if GitOut(Format('ls-remote --heads %s refs/heads/%s', [FOpt.Remote, Branch]), Out1, 600) = 0 then
+    Remote := Copy(Trim(Out1), 1, 40);
+  Range := 'refs/heads/' + Branch;
+  if (Remote <> '') and (RefSha(Remote) <> '') then Range := Range + ' ^' + Remote;
+  if GitOut('rev-list --reverse --first-parent ' + Range, Out1, 600) <> 0 then
+    raise Exception.Create('Could not list the commits to push: ' + Trim(Out1));
+  Commits := Trim(Out1).Split([#10], TStringSplitOptions.ExcludeEmpty);
+  Done := -1;
+  Step := StepCommits;
+  while Done < High(Commits) - StepCommits do
+  begin
+    Target := Min(Done + Step, High(Commits));
+    Log(Format('  %s: up to commit %d of %d', [Branch, Target + 1, Length(Commits)]));
+    if GitOut(Format('push --porcelain %s %s:refs/heads/%s',
+              [FOpt.Remote, Trim(Commits[Target]), Branch]), Out1, 6 * 3600) = 0 then
+    begin
+      Done := Target;
+      Step := StepCommits;
+    end
+    else if Step > 50 then
+    begin
+      Step := Step div 2;
+      Log(Format('  refused (%s); retrying %d commits at a time',
+        [Copy(Trim(Out1), 1, 120), Step]));
+    end
+    else
+      raise Exception.Create('git push of the branch failed:'#13#10 + Trim(Out1));
+  end;
+  if GitOut(Format('push --porcelain %s refs/heads/%s:refs/heads/%s',
+            [FOpt.Remote, Branch, Branch]), Out1, 6 * 3600) <> 0 then
+    raise Exception.Create('git push of the branch failed:'#13#10 + Trim(Out1));
+end;
+
+procedure TPipeline.PushToRemote;
+// The branch is pushed WITHOUT force: the update checked the remote is at or behind this
+// repository, so a rejection means someone pushed in the meantime - a reason to stop, never to
+// overwrite. Tags are pushed with force, because a label re-applied in TC moves its tag. Release
+// branches only ever move forward, so they are pushed without force too.
+var
+  Out1, Refs: string;
+  B: string;
+begin
   SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0');
+  EnsureRemote;
   if not RemoteExists then
     raise EUpdateRefused.CreateFmt('There is no remote "%s" to push to. Add it once with: ' +
       'git -C "%s" remote add %s <url>', [FOpt.Remote, FOpt.RepoDir, FOpt.Remote]);
@@ -3516,15 +4100,22 @@ begin
       raise Exception.Create('git lfs push failed:'#13#10 + Trim(Out1));
   end;
   Log(Format('Pushing %s to %s...', [FOpt.Branch, FOpt.Remote]));
-  if GitOut(Format('push --porcelain %s refs/heads/%s:refs/heads/%s',
-            [FOpt.Remote, FOpt.Branch, FOpt.Branch]), Out1, 6 * 3600) <> 0 then
-    raise Exception.Create('git push of the branch failed:'#13#10 + Trim(Out1));
+  PushBranchInSteps(FOpt.Branch);
   if FOpt.IncludeTags then
   begin
     Log(Format('Pushing tags to %s...', [FOpt.Remote]));
     if GitOut(Format('push --porcelain %s +refs/tags/*:refs/tags/*', [FOpt.Remote]),
               Out1, 6 * 3600) <> 0 then
       raise Exception.Create('git push of the tags failed:'#13#10 + Trim(Out1));
+  end;
+  if FOpt.ReleaseBranches and (FReleasePush.Count > 0) then
+  begin
+    Log(Format('Pushing %d release branch(es) to %s...', [FReleasePush.Count, FOpt.Remote]));
+    Refs := '';
+    for B in FReleasePush do Refs := Refs + Format(' refs/heads/%s:refs/heads/%s', [B, B]);
+    if GitOut(Format('push --porcelain %s%s', [FOpt.Remote, Refs]), Out1, 6 * 3600) <> 0 then
+      raise Exception.Create('git push of the release branches failed (someone may have ' +
+        'pushed to one since this run fetched them; run again):'#13#10 + Trim(Out1));
   end;
   Log(Format('Pushed to %s.', [FOpt.Remote]));
 end;

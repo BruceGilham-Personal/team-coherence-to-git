@@ -329,6 +329,7 @@ begin
   if FOpt.IncludeTags then Inc(FSteps);   // the label pass is a phase of its own
   if FOpt.UpdateMode then Inc(FSteps, 2); // matching the repository, following moves
   if FOpt.Push then Inc(FSteps);
+  if FOpt.ReleaseBranches then Inc(FSteps);
   MarkWork;
   FWatchdog := TStallWatchdog.Create(Self);
   Pipe := TPipeline.Create(FSession, FOpt);
@@ -346,6 +347,9 @@ begin
 
     SavedView := '';
     try
+      if FOpt.ReleaseBranches and not FOpt.IncludeTags then
+        raise EUpdateRefused.Create('--release-branches builds the branches from the version ' +
+          'labels, so it needs --tags as well.');
       // Run under <default>, where revision numbers resolve correctly, and put the
       // operator's own view back in the finally below - whatever happens.
       SavedView := Pipe.GetCurrentView;
@@ -430,6 +434,12 @@ begin
       begin
         Phase('Rebuilding version labels as refs');
         Pipe.ImportTags;
+      end;
+
+      if not Terminated and FOpt.ReleaseBranches then
+      begin
+        Phase('Keeping release branches in step with the labels');
+        Pipe.UpdateReleaseBranches;
       end;
 
       if not Terminated then

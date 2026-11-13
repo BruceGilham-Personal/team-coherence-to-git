@@ -67,8 +67,11 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--user <name>` | TC login for a non-interactive connect. The password is taken from the `TCPWD` environment variable, which keeps it off the command line; `--pwd` still works but is visible to anything that lists processes |
 | `--log <file>` | Write the on-screen log to this file on exit |
 | `--update` | Bring an already-migrated work folder up to date: add only what TC has that the repository does not. See *Keeping a migrated repository up to date* |
-| `--push` | After a successful run, push the branch (and, with `--tags`, the tags) to the remote |
+| `--push` | After a successful run, push the branch (and, with `--tags`, the tags; with `--release-branches`, those) to the remote. A branch far ahead of the remote goes up in steps of 2,000 commits, because GitHub refuses a single push over 2 GB |
 | `--remote <name>` | The git remote to check against and push to. Default `origin` |
+| `--remote-url <url>` | The remote's URL. Added to the repository when it has no such remote; a remote that already points elsewhere stops the run rather than being changed |
+| `--release-branches` | Keep a `release/<label>` branch for every version label, chained so a fix merges forward. Needs `--tags`. See *Release branches* |
+| `--release-skip <masks>` | `;`-separated masks of labels that get no release branch - typically the label on the version still being built, which is the branch itself |
 | `--state <file>` | The migration's checkpoint file, when it is not `state.txt` in the work folder. Only a first `--update` reads it |
 | `--filter <script>` | A content filter every file passes through before it reaches git - for a published history that was redacted. Run with one argument, a list file of `<input>TAB<output>` lines. A `.pl` script runs under Git for Windows' Perl; `tools\filters\redact-blobs.pl` applies a `rules.pl` of your own |
 | `--exclude <masks>` | `;`-separated masks of paths never written to git, e.g. `*.pfx` |
@@ -88,7 +91,8 @@ Coherence since, as ordinary commits on top of the published branch. Run it from
 work folder** as the migration: its `meta\` and blob cache are how it knows what is already in
 git.
 
-One-time setup, in the repository the migration created:
+One-time setup, in the repository the migration created - or pass `--remote-url <url>` (with
+`Run-Migration.ps1`, `-RemoteUrl`) and it is done for you:
 
 ```
 git -C D:\migration\repo.git remote add origin <url>
@@ -126,7 +130,9 @@ What an update does:
    out. A revision older than one of the same file already in git is not added - it would put
    old content over new - and is listed in `meta\update_behind.csv`.
 7. **Rebuilds the tags.** A label re-applied in TC moves its tag; a label deleted in TC leaves
-   its tag, which is listed in the log for a person to decide about.
+   its tag, which is listed in the log for a person to decide about. A moved tag keeps its
+   place on the branch (its parent), and a tag written as a root commit by an earlier version
+   is given one - see *Release branches* for why that matters.
 8. **Removes deleted files**, by the same trusted-listing check as a migration, and only those
    still at the tip - so an update with nothing deleted adds no commit for it.
 9. **Pushes**, with `--push`: the branch as a fast-forward, never forced; the tags forced, since
@@ -159,6 +165,61 @@ What it cannot do:
   the repository.
 - **Move dates.** TC records none, so moves and deletions are committed when the update runs,
   not when they happened.
+
+## Release branches
+
+`--release-branches` keeps a branch per version label, `release/<label>`, for fixing a released
+version in git and carrying the fix up to the newer ones:
+
+```powershell
+.\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push `
+  -Branch main -ReleaseBranches -ReleaseSkip 'V7.0.0'
+```
+
+Labels whose names start with `v` or `V` and a digit get a branch; anything else
+(`zInvalidVersioning`) does not, nor does anything matching `--release-skip`. They are chained
+in version order - `v1.7` < `v1.7.01` < `v4.0.0` < `v4.0.0_GA` < `v4.0.0_HF1` < `v4.1.0`, the
+numbers compared as numbers and any suffix in natural order after the bare version.
+
+To fix v5 and roll the fix up:
+
+```
+git switch release/V5.2.0        # commit the fix
+git switch release/V6.0.0 && git merge release/V5.2.0
+git switch release/V6.1.0 && git merge release/V6.0.0
+```
+
+Then make the same fix in Team Coherence for the version still being built there; the next
+update brings it into the branch. Merging into the mirrored branch itself is the one step that
+must not happen in git while TC is in use - see *What it cannot do* above.
+
+**Why it is built the way it is**
+
+- **A label commit is a whole snapshot, so each branch first records the one before as
+  included.** Merged as they are, `release/V5.2.0` into `release/V6.0.0` would carry every
+  difference between the two snapshots - v5's files into v6. Tried on a real repository: 31
+  files changed by a one-file fix. So each branch after the first starts with a merge that
+  changes no file and says "this already includes the previous release". After it, a merge
+  forward carries only what was committed on the older branch since.
+- **Label commits hang off the branch.** Each label commit's parent is a commit on the branch -
+  the newest one checked in no later than the newest revision the label holds - and a label
+  re-applied in TC keeps the parent it had. A label written as a root commit shares no
+  history with anything, and two branches with no common history cannot be merged usefully:
+  every file conflicts.
+- **tc2git never forces a release branch.** It starts each one, and when a label is
+  re-applied in TC it moves that branch forward with one commit holding the label's new
+  files - but only while nobody has committed to the branch in git. If someone has, the branch
+  is left alone, the log says so, and `meta\release_behind.csv` lists it with the commands to
+  compare. Once a person has brought the label's changes in, the next run notices and carries
+  on.
+- **TC's own changes are not merged forward.** A fix TC makes to v6.0 reaches v6.1 when v6.1
+  is re-labelled in TC, so the next branch only records it as included.
+- **The remote is read first.** Fixes are pushed to the remote by the people making them, so
+  each run fetches the release branches before touching them, takes a branch that moved there,
+  and leaves alone - with a warning - one that changed both here and there.
+- `meta\release_branches.csv` remembers, per branch, the label commit and the tip tc2git last
+  wrote. A branch already present when the option is first used is taken on only if it holds
+  exactly its label.
 
 ## How long it takes, and why
 

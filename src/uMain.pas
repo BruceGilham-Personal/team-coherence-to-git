@@ -64,6 +64,8 @@ type
     FStateFile: string;
     // --filter: content filter script; --exclude: ';'-separated masks of paths never written.
     FFilter, FExclude: string;
+    FRemoteUrl, FReleaseSkip: string;
+    FReleaseBranches: Boolean;
     FWorker: TMigrationThread;
     // layout metrics, all derived from the rendered font in BuildUi
     FRowH, FBtnH, FPad, FGap, FLineH: Integer;
@@ -274,6 +276,9 @@ begin
     else if A = '--state'    then begin FStateFile := Next(I); Inc(I); end
     else if A = '--filter'   then begin FFilter := Next(I); Inc(I); end
     else if A = '--exclude'  then begin FExclude := Next(I); Inc(I); end
+    else if A = '--remote-url' then begin FRemoteUrl := Next(I); Inc(I); end
+    else if A = '--release-branches' then FReleaseBranches := True
+    else if A = '--release-skip' then begin FReleaseSkip := Next(I); Inc(I); end
     else if A = '--font'     then Inc(I);   // consumed in BuildUi
     ;
     Inc(I);
@@ -1058,6 +1063,9 @@ begin
   Opt.StateFile := FStateFile;
   Opt.Filter := FFilter;
   Opt.Exclude := FExclude;
+  Opt.RemoteUrl := FRemoteUrl;
+  Opt.ReleaseBranches := FReleaseBranches;
+  Opt.ReleaseSkip := FReleaseSkip;
   Opt.FetchThreads := StrToIntDef(edThreads.Text, 8);
   // Check-ins per resumable batch. Larger batches also give the fetch workers more
   // distinct archives to choose from, which matters because one archive is never fetched

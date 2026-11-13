@@ -71,6 +71,13 @@ param(
   [string] $Filter = '',
   # ';'-separated masks of paths never written to git, e.g. '*.pfx'.
   [string] $Exclude = '',
+  # URL of -Remote: added to the repository when it has no such remote. A remote that already
+  # points somewhere else is refused, not changed.
+  [string] $RemoteUrl = '',
+  # Keep a release/<label> branch per version label, chained so fixes merge forward. Needs -Tags.
+  [switch] $ReleaseBranches,
+  # ';'-separated masks of labels that get no release branch, e.g. the version still in work.
+  [string] $ReleaseSkip = '',
   [int]    $MaxAttempts = 400,
   [int]    $RetrySeconds = 60
 )
@@ -134,6 +141,10 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   if ($Filter) { $a += @('--filter', $Filter) }
   if ($Exclude) { $a += @('--exclude', $Exclude) }
   if ($Push) { $a += @('--push', '--remote', $Remote) }
+  elseif ($RemoteUrl -or $ReleaseBranches) { $a += @('--remote', $Remote) }
+  if ($RemoteUrl) { $a += @('--remote-url', $RemoteUrl) }
+  if ($ReleaseBranches) { $a += '--release-branches' }
+  if ($ReleaseSkip) { $a += @('--release-skip', $ReleaseSkip) }
   $argLine = ($a | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
 
   $before = Get-Checkpoint
