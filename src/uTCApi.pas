@@ -72,6 +72,9 @@ type
     // for free, and it is what makes the label pass cheap: only revisions with VerCount > 0
     // need to be asked WHICH labels they carry. Without it the pass asks all 44,450.
     VerCount: Integer;
+    // The same for promotion levels: how many this revision has been promoted to. -1 when the
+    // metadata was saved before this was recorded, and then none are asked for.
+    PromoCount: Integer;
   end;
 
   TTCLabel = record
@@ -191,7 +194,8 @@ function SplitCsv(const Line: string): TArray<string>;
 implementation
 
 uses
-  System.DateUtils, System.NetEncoding, System.IOUtils, System.StrUtils, Winapi.WinSock;
+  System.DateUtils, System.NetEncoding, System.IOUtils, System.StrUtils, System.Math,
+  Winapi.WinSock;
 
 const
   lt_VersionLabel   = 1;
@@ -446,6 +450,7 @@ begin
   R.When := TCDateToDT(Timestamp);
   R.Size := OriginalSize;
   R.VerCount := VerCount;   // free here; saves tens of thousands of calls in the label pass
+  R.PromoCount := PromoCount;
   GSession.Revisions.Add(R);
   Result := True;
 end;
@@ -1120,14 +1125,14 @@ begin
         if Revisions[I].VerCount >= 0 then
         begin
           HaveVerCounts := True;
-          Inc(Expected, Revisions[I].VerCount);
+          Inc(Expected, Revisions[I].VerCount + Max(Revisions[I].PromoCount, 0));
         end;
 
       if HaveVerCounts then
       begin
         J := 0;
         for I := 0 to Revisions.Count - 1 do
-          if Revisions[I].VerCount > 0 then Inc(J);
+          if (Revisions[I].VerCount > 0) or (Revisions[I].PromoCount > 0) then Inc(J);
         Log(Format('  %d of %d revisions carry a label; expecting %d attachment(s)',
           [J, Revisions.Count, Expected]));
         Log('  skipping the per-file scan: ver_count already says exactly which to ask');
@@ -1170,7 +1175,7 @@ begin
         // The big win: TC already told us how many labels this revision carries, so a
         // revision with none needs no call at all. -1 means the metadata predates this and
         // we have to ask.
-        if Revisions[I].VerCount = 0 then
+        if (Revisions[I].VerCount = 0) and (Revisions[I].PromoCount <= 0) then
         begin
           Inc(NoLabels);
           Continue;
@@ -1182,7 +1187,12 @@ begin
         GCurrentRev := Revisions[I].Revision;
         Item(Format('%s @ %s  (%d attachments found)',
           [Revisions[I].TCPath, Revisions[I].Revision, Attachments.Count]));
-        Fn(Revisions[I].FileID, Revisions[I].RevID, lt_VersionLabel, nil, nil, CbAttach);
+        if Revisions[I].VerCount <> 0 then
+          Fn(Revisions[I].FileID, Revisions[I].RevID, lt_VersionLabel, nil, nil, CbAttach);
+        // Promotion levels attach to revisions the same way. Asked only where TC counted
+        // some: unknown (-1, older metadata) is not asked, or every revision would be.
+        if Revisions[I].PromoCount > 0 then
+          Fn(Revisions[I].FileID, Revisions[I].RevID, lt_PromotionLabel, nil, nil, CbAttach);
         WRevs.WriteLine(Format('%d,%s', [Revisions[I].FileID, Revisions[I].Revision]));
         WRevs.Flush;
         Progress('Matching labels to revisions', I + 1, Revisions.Count);
@@ -1386,6 +1396,7 @@ begin
         // ver_count is optional: -1 means "not recorded", which the label pass treats as
         // "must ask", so an older file still works - just slowly.
         if Length(C) > 9 then R.VerCount := StrToIntDef(C[9], -1) else R.VerCount := -1;
+        if Length(C) > 10 then R.PromoCount := StrToIntDef(C[10], -1) else R.PromoCount := -1;
       end
       else
       begin
@@ -1397,6 +1408,7 @@ begin
         R.Comment := FromB64(C[5]);
         if Length(C) > 7 then R.Size := StrToIntDef(C[7], 0);
         R.VerCount := -1;   // old layout: unknown, so the label pass must ask
+        R.PromoCount := -1;
       end;
       Revisions.Add(R);
     end;
@@ -1494,13 +1506,14 @@ begin
     // output. Leaving it out of this file cost a 5-hour pass whose every answer was the same
     // 38 labels repeated for all 215 revisions of one heavily-revised unit.
     for I := 0 to Revisions.Count - 1 do
-      L.Add(Format('%d,%d,%s,%s,%s,%s,%s,modify,%d,%d',
+      L.Add(Format('%d,%d,%s,%s,%s,%s,%s,modify,%d,%d,%d',
         [Revisions[I].FileID, Revisions[I].RevID,
          CsvQ(Revisions[I].TCPath), CsvQ(Revisions[I].Revision),
          CsvQ(Revisions[I].Author), Iso(Revisions[I].When), B64(Revisions[I].Comment),
-         Revisions[I].Size, Revisions[I].VerCount]));
+         Revisions[I].Size, Revisions[I].VerCount, Revisions[I].PromoCount]));
     SaveList(TPath.Combine(OutDir, 'revisions.csv'),
-      'file_id,rev_id,tc_path,revision,author,timestamp_utc,comment_b64,action,size,ver_count', L);
+      'file_id,rev_id,tc_path,revision,author,timestamp_utc,comment_b64,action,size,ver_count,' +
+      'promo_count', L);
 
     L.Clear;
     for I := 0 to Labels.Count - 1 do

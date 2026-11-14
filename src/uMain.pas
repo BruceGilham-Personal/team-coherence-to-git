@@ -64,8 +64,9 @@ type
     FStateFile: string;
     // --filter: content filter script; --exclude: ';'-separated masks of paths never written.
     FFilter, FExclude: string;
-    FRemoteUrl, FReleaseSkip: string;
-    FReleaseBranches: Boolean;
+    FRemoteUrl, FReleaseSkip, FMainLine: string;
+    FReleaseBranches, FRebuildRelease: Boolean;
+    FOffline: Boolean;   // --offline: from saved metadata, no Team Coherence connection
     FWorker: TMigrationThread;
     // layout metrics, all derived from the rendered font in BuildUi
     FRowH, FBtnH, FPad, FGap, FLineH: Integer;
@@ -279,6 +280,9 @@ begin
     else if A = '--remote-url' then begin FRemoteUrl := Next(I); Inc(I); end
     else if A = '--release-branches' then FReleaseBranches := True
     else if A = '--release-skip' then begin FReleaseSkip := Next(I); Inc(I); end
+    else if A = '--main-line' then begin FMainLine := Next(I); Inc(I); end
+    else if A = '--rebuild-release-branches' then FRebuildRelease := True
+    else if A = '--offline' then FOffline := True
     else if A = '--font'     then Inc(I);   // consumed in BuildUi
     ;
     Inc(I);
@@ -319,6 +323,15 @@ var
 begin
   FAutoTimer.Enabled := False;
   try
+    if FOffline then
+    begin
+      // everything comes from meta\: no connection, no login window
+      DoLog('Offline: working from the metadata the last run saved. Team Coherence is not ' +
+        'contacted, and nothing is pushed.');
+      if FSession = nil then FSession := TTCSession.Create(edTcBin.Text);
+      RunClick(nil);
+      Exit;
+    end;
     ConnectClick(nil);
     if (FSession = nil) or not FSession.Connected then
     begin
@@ -967,10 +980,12 @@ procedure TMainForm.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
 begin
   if FRunning then
   begin
+    // No is the default: a stray Enter must not end a run that may have hours left in it
     CanClose := MessageDlg('A migration is running. Stop it and close?',
-      mtConfirmation, [mbYes, mbNo], 0) = mrYes;
+      mtConfirmation, [mbYes, mbNo], 0, mbNo) = mrYes;
     if CanClose then
     begin
+      DoLog('The window was closed: stopping the run.');
       FCancel := True;
       if Assigned(FWorker) then FWorker.Terminate;
     end;
@@ -984,7 +999,7 @@ var
   I, Chosen: Integer;
   Roots: TArray<Cardinal>;
 begin
-  if (FSession = nil) or not FSession.Connected then
+  if (FSession = nil) or (not FSession.Connected and not FOffline) then
   begin
     if not FAuto then MessageDlg('Connect to Team Coherence first.', mtInformation, [mbOK], 0);
     Exit;
@@ -1000,7 +1015,7 @@ begin
       Roots[Chosen] := Cardinal(lbProjects.Items.Objects[I]);
       Inc(Chosen);
     end;
-  if Chosen = 0 then
+  if (Chosen = 0) and not FOffline then   // offline, the projects are what meta\ holds
   begin
     if not FAuto then MessageDlg('Tick at least one project to migrate.', mtInformation, [mbOK], 0);
     Exit;
@@ -1066,6 +1081,9 @@ begin
   Opt.RemoteUrl := FRemoteUrl;
   Opt.ReleaseBranches := FReleaseBranches;
   Opt.ReleaseSkip := FReleaseSkip;
+  Opt.MainLine := FMainLine;
+  Opt.RebuildReleaseBranches := FRebuildRelease;
+  Opt.Offline := FOffline;
   Opt.FetchThreads := StrToIntDef(edThreads.Text, 8);
   // Check-ins per resumable batch. Larger batches also give the fetch workers more
   // distinct archives to choose from, which matters because one archive is never fetched

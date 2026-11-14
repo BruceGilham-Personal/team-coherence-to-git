@@ -330,6 +330,7 @@ begin
   if FOpt.UpdateMode then Inc(FSteps, 2); // matching the repository, following moves
   if FOpt.Push then Inc(FSteps);
   if FOpt.ReleaseBranches then Inc(FSteps);
+  if FOpt.UpdateMode and (FOpt.MainLine <> '') then Inc(FSteps);
   MarkWork;
   FWatchdog := TStallWatchdog.Create(Self);
   Pipe := TPipeline.Create(FSession, FOpt);
@@ -350,9 +351,20 @@ begin
       if FOpt.ReleaseBranches and not FOpt.IncludeTags then
         raise EUpdateRefused.Create('--release-branches builds the branches from the version ' +
           'labels, so it needs --tags as well.');
+      if FOpt.RebuildReleaseBranches and not FOpt.ReleaseBranches then
+        raise EUpdateRefused.Create('--rebuild-release-branches needs --release-branches.');
+      if (FOpt.MainLine <> '') and not FOpt.IncludeTags then
+        raise EUpdateRefused.Create('--main-line follows a version label, so it needs --tags.');
+      if FOpt.Offline and not FOpt.UpdateMode then
+        raise EUpdateRefused.Create('--offline works from a previous run''s metadata: it needs ' +
+          '--update.');
+      if FOpt.Offline and FOpt.Push then
+        raise EUpdateRefused.Create('--offline does not read Team Coherence, so what it builds ' +
+          'is not to be published: it cannot be combined with --push.');
       // Run under <default>, where revision numbers resolve correctly, and put the
       // operator's own view back in the finally below - whatever happens.
-      SavedView := Pipe.GetCurrentView;
+      if FOpt.Offline then SavedView := ''
+      else SavedView := Pipe.GetCurrentView;
       QLog(Format('Active Team Coherence view: %s', [SavedView]));
       if (SavedView <> '') and (SavedView <> '<default>') then
       begin
@@ -375,7 +387,14 @@ begin
           on E: ETCError do raise EUpdateRefused.Create(E.Message);   // e.g. a zone mismatch
         end;
         Pipe.BeginUpdate;
-        if not Terminated then ReadMetadata;
+        if FOpt.Offline then
+        begin
+          Phase('Reading the repository structure - skipped, offline');
+          Phase('Reading revision history - skipped, offline');
+          QLog(Format('Using the saved metadata: %d files, %d revisions, %d labels.',
+            [FSession.Files.Count, FSession.Revisions.Count, FSession.Labels.Count]));
+        end
+        else if not Terminated then ReadMetadata;
         if not Terminated and FOpt.IncludeTags then Pipe.PrepareLabelCarryOver;
       end
       // ---- metadata: reload if a previous run already gathered it -----------------------
@@ -390,13 +409,18 @@ begin
       // "Attachments.Count = 0" would have treated any interrupted pass as a completed one.
       // A pass that really is finished costs only the load of its own checkpoint files.
       if not Terminated and FOpt.IncludeTags then
-      begin
-        Phase('Matching labels to revisions');
-        FSession.EnumAttachments(FOpt.MetaDir);
-        FSession.SaveCsvs(FOpt.MetaDir);
-      end;
+        if FOpt.Offline then
+          Phase('Matching labels to revisions - skipped, offline: the saved attachments are used')
+        else
+        begin
+          Phase('Matching labels to revisions');
+          FSession.EnumAttachments(FOpt.MetaDir);
+          FSession.SaveCsvs(FOpt.MetaDir);
+        end;
 
-      if not Terminated then
+      if not Terminated and FOpt.Offline then
+        Phase('Checking that revision selection works - skipped, offline')
+      else if not Terminated then
       begin
         Phase('Checking that revision selection works');
         if FSession.Files.Count = 0 then
@@ -415,6 +439,11 @@ begin
         begin
           Phase('Following files moved in Team Coherence');
           Pipe.FollowMovedFiles;
+          if not Terminated and (FOpt.MainLine <> '') then
+          begin
+            Phase('Following label ' + FOpt.MainLine + '''s line');
+            Pipe.FollowMainLine;
+          end;
           if not Terminated then
           begin
             Phase('Adding new check-ins');
@@ -444,8 +473,13 @@ begin
 
       if not Terminated then
       begin
-        Phase('Removing files deleted in Team Coherence');
-        Pipe.RemoveDeletedFiles;
+        if FOpt.Offline then
+          Phase('Removing files deleted in Team Coherence - skipped, offline')
+        else
+        begin
+          Phase('Removing files deleted in Team Coherence');
+          Pipe.RemoveDeletedFiles;
+        end;
         Pipe.Verify;
       end;
 
@@ -478,6 +512,7 @@ begin
       begin
         FSummary := E.Message;
         QLog('ERROR: ' + E.Message);
+        if GStage <> '' then QLog('  while: ' + GStage);
       end;
     end;
   finally
@@ -501,6 +536,8 @@ begin
       FWatchdog.Free;
       FWatchdog := nil;
     end;
+    // a Stop mid-phase leaves by one of the phases' own exits, before any summary is set
+    if (FSummary = '') and Terminated then FSummary := 'Stopped at your request.';
     ReportDone(FOk, FRefused, FSummary);
   end;
 end;

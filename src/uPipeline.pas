@@ -69,6 +69,16 @@ type
     // ';'-separated masks of labels that get no release branch, e.g. the label on the version
     // still being built, which is the branch itself.
     ReleaseSkip: string;
+    // The version label whose view the branch follows, e.g. 'V7.0.0'; '' = every revision, in
+    // check-in order. Revisions checked in under views based on other labels - fixes to older
+    // releases - then stay off the branch. See OnMainLine.
+    MainLine: string;
+    // Rebuild every release branch tc2git owns from Team Coherence's history, replacing what is
+    // there. Pushed with force. See UpdateReleaseBranches.
+    RebuildReleaseBranches: Boolean;
+    // For testing: an update from the metadata the last run saved, without connecting to Team
+    // Coherence. Nothing new is read, deleted files are not looked for, and it never pushes.
+    Offline: Boolean;
   end;
 
   // A state that needs a person to look at it, not a retry: the supervisor stops on it.
@@ -135,6 +145,16 @@ type
     FBranchShas: TArray<string>;               // the branch's first-parent line, newest first
     FBranchTimes: TArray<Int64>;               // ... and each commit's author time (Unix)
     FReleasePush: TStringList;                 // release branches safe to push this run
+    // ---- the line the branch follows: --main-line -------------------------------------------
+    FMainLineOn: Boolean;
+    FMainAt: TDictionary<Cardinal, string>;    // file id -> its revision in the main-line label
+    FOtherAt: TDictionary<Cardinal, string>;   // file id -> other version labels' revisions, ';'
+    procedure EnsureMainLine;
+    function OnMainLine(const R: TTCRevision): Boolean;
+    function InMain(const R: TTCRevision): Boolean;
+    function ForkPoint(const AtLabel: TDictionary<Cardinal, string>; out Cut: Int64): string;
+    function ReplayRevisions(const Base: string; Revs: TArray<TTCRevision>;
+      out Commits: Integer): string;
     function Excluded(const Path: string): Boolean;
     function TreeOf(const Rev: string): string;
     function AttachPoint(NewestUtc: TDateTime): string;
@@ -144,6 +164,7 @@ type
     procedure ReattachTag(const TagRef: string; NewestUtc: TDateTime);
     procedure EnsureRemote;
     procedure PushBranchInSteps(const Branch: string);
+    procedure PushLfsObjects;
     function IsLfsPath(const Path: string): Boolean;
     procedure LoadLfsPatterns(const Commit: string);
     procedure PrepareFiltered(const Shas: TArray<string>);
@@ -226,11 +247,17 @@ type
     procedure BeginUpdate;
     procedure PrepareLabelCarryOver;
     procedure FollowMovedFiles;
+    procedure FollowMainLine;
     procedure RunUpdate;
     procedure UpdateReleaseBranches;
     procedure PushToRemote;
     property Blobs: TList<TBlob> read FBlobs;
   end;
+
+var
+  // Where the release-branch work was when it failed: an error from a generic list names the
+  // list and the index, never the caller, and Win32 Delphi has no stack trace to say more.
+  GStage: string;
 
 implementation
 
@@ -259,10 +286,14 @@ begin
   FFiltered := TDictionary<string, string>.Create;
   FExcludes := FOpt.Exclude.Split([';'], TStringSplitOptions.ExcludeEmpty);
   FReleasePush := TStringList.Create;
+  FMainAt := TDictionary<Cardinal, string>.Create;
+  FOtherAt := TDictionary<Cardinal, string>.Create;
 end;
 
 destructor TPipeline.Destroy;
 begin
+  FOtherAt.Free;
+  FMainAt.Free;
   FReleasePush.Free;
   FFiltered.Free;
   FLedger.Free;
@@ -1287,6 +1318,10 @@ begin
       if not MoveFileEx(PChar(Obj + '.partial'), PChar(Obj),
                         MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
         RaiseLastOSError;
+      // Remembered until a push has uploaded it, across restarts, so the push can send just
+      // these instead of scanning the whole history for what the remote might lack.
+      TFile.AppendAllText(TPath.Combine(FOpt.MetaDir, 'lfs_pending.txt'), Oid + #13#10,
+        TEncoding.ASCII);
     end;
   end;
   Result := 'version https://git-lfs.github.com/spec/v1'#10 +
@@ -1883,6 +1918,239 @@ begin
              (SecondsBetween(A.When, B.When) <= FOpt.WindowSeconds));
 end;
 
+// ---------------------------------------------------------------- revision lines
+//
+// Team Coherence numbers a file's revisions 1.0, 1.1, ... on the trunk; the first revision of
+// a branch made from 1.5 is 1.5.1.0, its next 1.5.1.1, and a branch made from that 1.5.1.1.2.0.
+// Checking in under a view based on a label branches from the label's revision when the trunk
+// has moved on, and moves the label to the new revision. So every view is a LINE of revisions
+// per file - the revision its label holds and that revision's ancestors - and a revision's
+// number says which lines it is on.
+
+function RevOnLine(const A, B: string): Boolean;
+// True when revision A is B or one of B's ancestors: A is on the line that leads to B. A is on
+// that line when it agrees with B up to its own last number and that number is no greater than
+// B's at the same place: 1.49 and 1.49.1.3 lead to 1.49.1.18; 1.50 and 1.49.1.19 do not.
+var
+  PA, PB: TArray<string>;
+  I, N: Integer;
+begin
+  PA := A.Split(['.']);
+  PB := B.Split(['.']);
+  N := Length(PA);
+  if (N = 0) or (N > Length(PB)) or (A = '') then Exit(False);
+  for I := 0 to N - 2 do
+    if PA[I] <> PB[I] then Exit(False);
+  Result := StrToIntDef(PA[N - 1], MaxInt) <= StrToIntDef(PB[N - 1], -1);
+end;
+
+procedure TPipeline.EnsureMainLine;
+// Reads --main-line's label: the revision it holds of each file, and what every other version
+// label holds, which is what tells a revision checked in under another view from one checked in
+// under this label's view or under <default>.
+const
+  lt_VersionLabel = 1;
+var
+  L: TTCLabel;
+  A: TTCAttachment;
+  MainID: Cardinal;
+  IsVersion: TDictionary<Cardinal, Boolean>;
+  Found: Boolean;
+  S: string;
+begin
+  if FMainLineOn or (FOpt.MainLine = '') then Exit;
+  if not FOpt.IncludeTags then
+    raise EUpdateRefused.Create('--main-line follows a version label, so it needs --tags too.');
+  MainID := 0;
+  Found := False;
+  IsVersion := TDictionary<Cardinal, Boolean>.Create;
+  try
+    for L in FSession.Labels do
+    begin
+      IsVersion.AddOrSetValue(L.ID, L.LabelType = lt_VersionLabel);
+      if (L.LabelType = lt_VersionLabel) and SameText(L.Name, FOpt.MainLine) then
+      begin
+        MainID := L.ID;
+        Found := True;
+      end;
+    end;
+    if not Found then
+      raise EUpdateRefused.CreateFmt('--main-line: Team Coherence has no version label "%s".',
+        [FOpt.MainLine]);
+    FMainAt.Clear;
+    FOtherAt.Clear;
+    for A in FSession.Attachments do
+      if A.LabelID = MainID then
+        FMainAt.AddOrSetValue(A.FileID, A.Revision)
+      else if IsVersion.ContainsKey(A.LabelID) and IsVersion[A.LabelID] then
+      begin
+        if FOtherAt.TryGetValue(A.FileID, S) then S := S + ';' + A.Revision
+        else S := A.Revision;
+        FOtherAt.AddOrSetValue(A.FileID, S);
+      end;
+  finally
+    IsVersion.Free;
+  end;
+  if FMainAt.Count = 0 then
+    raise EUpdateRefused.CreateFmt('--main-line: label "%s" holds no revisions here.',
+      [FOpt.MainLine]);
+  FMainLineOn := True;
+  Log(Format('The branch follows label %s''s line: %d file(s) take the revision on its line; ' +
+    'files it does not hold take their newest revision.', [FOpt.MainLine, FMainAt.Count]));
+end;
+
+function TPipeline.OnMainLine(const R: TTCRevision): Boolean;
+// Whether a revision belongs on the branch. For a file the main-line label holds: the label's
+// revision and those before it on its line, and a later revision that continues that line -
+// unless another version label holds it or a revision after it, which means it was checked in
+// under that label's view: a fix to another release. A file the label does not hold keeps
+// every revision, as without --main-line.
+var
+  L, Others, O: string;
+begin
+  if not FMainLineOn then Exit(True);
+  if not FMainAt.TryGetValue(R.FileID, L) then Exit(True);
+  if RevOnLine(R.Revision, L) then Exit(True);
+  if not RevOnLine(L, R.Revision) then Exit(False);     // on another line altogether
+  if FOtherAt.TryGetValue(R.FileID, Others) then
+    for O in Others.Split([';']) do
+      if RevOnLine(R.Revision, O) then Exit(False);      // claimed by another view
+  Result := True;
+end;
+
+function TPipeline.InMain(const R: TTCRevision): Boolean;
+// Whether the branch's history holds this revision: what an update has handled, or for a
+// migration everything on the branch's line.
+begin
+  if FLedger.Count > 0 then
+    Result := FLedger.ContainsKey(Format('%d|%s', [R.FileID, R.Revision]))
+  else
+    Result := OnMainLine(R);
+end;
+
+procedure TPipeline.FollowMainLine;
+// Update mode, with --main-line: each file the label holds is put back on the label's line
+// where the branch holds something else. A branch built before --main-line took every revision
+// in check-in order, so a fix made for an older release after the newer work replaced that
+// work on the branch. Like a move, this is one commit, made before the new check-ins.
+var
+  Want: TDictionary<Cardinal, TTCRevision>;
+  Index: TObjectDictionary<string, TList<Integer>>;
+  Marks: TDictionary<string, Integer>;
+  Changes: TList<TChange>;
+  Shas, Listed: TStringList;
+  R, W: TTCRevision;
+  Lst: TList<Integer>;
+  E: TTreeEntry;
+  Chg: TChange;
+  N, Mark, I: Integer;
+  P, Msg, Out1: string;
+  GitProc: TProcessInformation;
+  GitIn: THandle;
+  FS: TStream;
+begin
+  if FOpt.MainLine = '' then Exit;
+  EnsureMainLine;
+  Want := TDictionary<Cardinal, TTCRevision>.Create;
+  Index := BlobIndex;
+  Marks := TDictionary<string, Integer>.Create;
+  Changes := TList<TChange>.Create;
+  Shas := TStringList.Create;
+  Listed := TStringList.Create;
+  try
+    // the newest revision on the line that git already has, per file the label holds
+    for R in FSession.Revisions do
+      if FMainAt.ContainsKey(R.FileID) and
+         FLedger.ContainsKey(Format('%d|%s', [R.FileID, R.Revision])) and OnMainLine(R) then
+        if not Want.TryGetValue(R.FileID, W) or (CompareDateTime(R.When, W.When) > 0) then
+          Want.AddOrSetValue(R.FileID, R);
+
+    for W in Want.Values do
+    begin
+      if not Index.TryGetValue(Format('%d|%s', [W.FileID, W.Revision]), Lst) then Continue;
+      for N in Lst do
+      begin
+        P := MemberPath(W.TCPath, FBlobs[N].Member);
+        // only a path the branch has: a file gone from the tip stays gone
+        if Excluded(P) or not FTree.TryGetValue(P, E) or (E.Sha = FBlobs[N].Sha) then Continue;
+        Chg.Path := P;
+        Chg.Sha := FBlobs[N].Sha;
+        Chg.Mark := N;          // the blob's index, until the stream gives it a mark
+        Changes.Add(Chg);
+        Shas.Add(FBlobs[N].Sha);
+        Listed.Add(Format('  %s: %s', [P, W.Revision]));
+      end;
+    end;
+    if Changes.Count = 0 then
+    begin
+      Log(Format('Every file label %s holds is on its line at the tip.', [FOpt.MainLine]));
+      Exit;
+    end;
+
+    PrepareFiltered(Shas.ToStringArray);
+    GitIn := 0;
+    if not StartFastImport(GitProc, GitIn) then
+      raise Exception.Create('Could not start git fast-import for the main line.');
+    FS := THandleStream.Create(GitIn);
+    try
+      Mark := 0;
+      for I := Changes.Count - 1 downto 0 do
+      begin
+        Chg := Changes[I];
+        if not EmitBlob(FS, FBlobs[Chg.Mark], Chg.Path, Marks, Mark, N) then
+        begin
+          Changes.Delete(I);
+          Continue;
+        end;
+        Chg.Mark := N;
+        Changes[I] := Chg;
+      end;
+      if Changes.Count > 0 then
+      begin
+        Listed.Sort;
+        Msg := Format('Follow label %s''s line in Team Coherence' + #10#10 +
+          'The view based on label %s has these files at the revisions below. The branch held ' +
+          'a later revision checked in under another release''s view, which belongs to that ' +
+          'release''s branch, not this one.' + #10#10 + '%s' + #10,
+          [FOpt.MainLine, FOpt.MainLine, string.Join(#10, Listed.ToStringArray)]);
+        PutLine(FS, 'commit refs/heads/' + FOpt.Branch);
+        PutLine(FS, Format('committer %s %s', [MapAuthor('tc'), GitStamp(NowUtc)]));
+        PutLine(FS, 'data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
+        PutLine(FS, Msg);
+        PutLine(FS, 'from refs/heads/' + FOpt.Branch + '^0');
+        for Chg in Changes do
+          PutLine(FS, Format('M 100644 :%d %s', [Chg.Mark, Chg.Path]));
+      end;
+    finally
+      FS.Free;
+    end;
+    if FinishFastImport(GitProc, GitIn, Out1) <> 0 then
+    begin
+      Log('git fast-import FAILED on the main line:');
+      Log(Out1);
+      raise Exception.Create('git fast-import failed while following the main line.');
+    end;
+    if Changes.Count = 0 then Exit;
+    for Chg in Changes do
+    begin
+      E := FTree[Chg.Path];
+      E.Sha := Chg.Sha;
+      FTree.AddOrSetValue(Chg.Path, E);
+    end;
+    Log(Format('%d path(s) put back on label %s''s line; they held revisions checked in for ' +
+      'other releases:', [Changes.Count, FOpt.MainLine]));
+    for P in Listed do Log(P);
+    SaveUpdateCheckpoint;
+  finally
+    Listed.Free;
+    Shas.Free;
+    Changes.Free;
+    Marks.Free;
+    Index.Free;
+    Want.Free;
+  end;
+end;
+
 procedure TPipeline.RunIncremental;
 var
   Revs: TArray<TTCRevision>;
@@ -1897,6 +2165,7 @@ begin
 
   LoadAuthorMap;
   LoadBlobManifest;
+  EnsureMainLine;
 
   // Watch the link for the whole run: an outage now pauses the workers instead of failing
   // thousands of revisions and abandoning the batch.
@@ -2154,6 +2423,9 @@ begin
       for I := StartIdx to EndIdx - 1 do
       begin
         if Cancelled then Break;
+        // A fix checked in for another release is fetched - its release branch is built
+        // from it - but is not part of this branch.
+        if FMainLineOn and not OnMainLine(FSorted[I]) then Continue;
         // A new commit starts when the author or comment changes, when the optional time
         // window is exceeded, OR when this file is already in the commit being built.
         //
@@ -2269,8 +2541,11 @@ procedure TPipeline.ImportTags;
 // here are indexed; the original's nested scan was labels x attachments x 44,450 revisions.
 const
   // TC label types. uTCApi declares these in its implementation section, so they are not
-  // visible here; promotion levels (2) are deliberately not turned into refs.
-  lt_VersionLabel = 1;
+  // visible here. A promotion level (2) is attached to revisions just as a version label is -
+  // the revision of each file promoted to it - so it is written the same way, under
+  // refs/tags/promotion/ so that it is never taken for a version.
+  lt_VersionLabel   = 1;
+  lt_PromotionLabel = 2;
 var
   GitProc: TProcessInformation;
   GitIn: THandle;
@@ -2368,8 +2643,12 @@ begin
     for I := 0 to FSession.Labels.Count - 1 do
     begin
       Refs[I] := '';
-      if FSession.Labels[I].LabelType <> lt_VersionLabel then Continue;
-      Ep := 'refs/tags/' + SanitiseRefName(FSession.Labels[I].Name);
+      case FSession.Labels[I].LabelType of
+        lt_VersionLabel:   Ep := 'refs/tags/' + SanitiseRefName(FSession.Labels[I].Name);
+        lt_PromotionLabel: Ep := 'refs/tags/promotion/' + SanitiseRefName(FSession.Labels[I].Name);
+      else
+        Continue;
+      end;
       // Sanitising can map two different TC names onto one ref ("V 4.2" and "V/4.2"), and
       // the second would silently replace the first.
       if UsedRefs.ContainsKey(LowerCase(Ep)) then
@@ -3388,9 +3667,11 @@ begin
   Done := TStringList.Create;
   Found := TStringList.Create;
   try
+    // version labels and promotion levels together: both are in the attachment list
     for R in FOldRevs do
       if R.VerCount >= 0 then
-        OldVer.AddOrSetValue(Format('%d|%s', [R.FileID, R.Revision]), R.VerCount);
+        OldVer.AddOrSetValue(Format('%d|%s', [R.FileID, R.Revision]),
+          R.VerCount + Max(R.PromoCount, 0));
     for A in FOldAttach do
     begin
       Key := Format('%d|%s', [A.FileID, A.Revision]);
@@ -3409,9 +3690,9 @@ begin
     Asked := 0;
     for R in FSession.Revisions do
     begin
-      if R.VerCount <= 0 then Continue;
+      if (R.VerCount <= 0) and (R.PromoCount <= 0) then Continue;
       Key := Format('%d|%s', [R.FileID, R.Revision]);
-      if OldVer.TryGetValue(Key, V) and (V = R.VerCount) and
+      if OldVer.TryGetValue(Key, V) and (V = R.VerCount + Max(R.PromoCount, 0)) and
          OldLabels.TryGetValue(Key, Lst) and (Lst.Count = V) then
       begin
         Done.Add(Format('%d,%s', [R.FileID, R.Revision]));
@@ -3562,29 +3843,39 @@ var
   NewRevs: TList<TTCRevision>;
   Behind: TStringList;
   Key: string;
-  I, P, Idx, BatchEnd, Total, BatchNo, FetchWindow: Integer;
+  I, P, Idx, BatchEnd, Total, BatchNo, FetchWindow, OffLine: Integer;
 begin
   if not TestConnection then
     raise Exception.Create(
       'The Team Coherence server is not reachable.'#13#10#13#10 +
       'Check the VPN, then run again - the update continues from where it stopped.');
   LoadAuthorMap;
+  EnsureMainLine;
 
   Revs := FSession.Revisions.ToArray;
   SortChronologically(Revs);
   LastIdx := TDictionary<Cardinal, Integer>.Create;
   NewRevs := TList<TTCRevision>.Create;
   Behind := TStringList.Create;
+  OffLine := 0;
   try
-    // where each file's history in git ends, in today's order
+    // where each file's history in git ends, in today's order - on the branch's line: a fix
+    // for another release, handled but kept off the branch, does not count
     for I := 0 to High(Revs) do
-      if FLedger.ContainsKey(Format('%d|%s', [Revs[I].FileID, Revs[I].Revision])) then
+      if FLedger.ContainsKey(Format('%d|%s', [Revs[I].FileID, Revs[I].Revision])) and
+         OnMainLine(Revs[I]) then
         LastIdx.AddOrSetValue(Revs[I].FileID, I);
     for I := 0 to High(Revs) do
     begin
       Key := Format('%d|%s', [Revs[I].FileID, Revs[I].Revision]);
       if FLedger.ContainsKey(Key) then Continue;
-      if LastIdx.TryGetValue(Revs[I].FileID, P) and (I < P) then
+      // still fetched, for its release branch; ImportRange leaves it off this one
+      if not OnMainLine(Revs[I]) then
+      begin
+        Inc(OffLine);
+        NewRevs.Add(Revs[I]);
+      end
+      else if LastIdx.TryGetValue(Revs[I].FileID, P) and (I < P) then
         Behind.Add(Format('%d,%s,%s', [Revs[I].FileID, CsvQ(Revs[I].TCPath),
           CsvQ(Revs[I].Revision)]))
       else
@@ -3597,6 +3888,9 @@ begin
       Behind.Insert(0, 'file_id,tc_path,revision');
       Behind.SaveToFile(TPath.Combine(FOpt.MetaDir, 'update_behind.csv'), TEncoding.UTF8);
     end;
+    if OffLine > 0 then
+      Log(Format('  %d new revision(s) were checked in under other releases'' views: fetched ' +
+        'for their release branches, not added to %s.', [OffLine, FOpt.Branch]));
     FSorted := NewRevs.ToArray;
   finally
     Behind.Free;
@@ -3746,14 +4040,305 @@ begin
   Result := StrCmpLogicalW(PWideChar(RA), PWideChar(RB));
 end;
 
+function TPipeline.ForkPoint(const AtLabel: TDictionary<Cardinal, string>;
+  out Cut: Int64): string;
+// Where a release's history leaves the branch. Cut is the commit time after which the branch's
+// revisions are not in the fork. '' = the release shares no commit with the branch.
+//
+// Each candidate fork is costed in the file changes the release would not share with the
+// branch: the revisions on the label's line still to be replayed after it, plus one for each
+// file the branch had already taken off the line by then (the closing "Match label" commit sets
+// those). The cheapest fork wins, the later one on a tie. Forking at the FIRST file to leave
+// the line instead let one file the release kept at a 2004 revision pull every release's fork
+// back to 2005, replaying ten thousand check-ins the branch already had.
+//
+// The cost follows exactly what History does from a fork: with the fork holding revision C of
+// a file, the line's revisions after C are replayed when C is on the line; when it is not, the
+// line's revisions from Cut on are replayed and the file is set at the end; a file the fork does
+// not hold has its whole line replayed.
+type
+  TFileCost = record
+    Line: TList<string>;     // the file's revisions on the label's line
+    Later: Integer;          // how many of them are dated at or after the cut being costed
+    Cur: string;             // the branch's newest revision of it before that cut
+    Cost: Integer;
+  end;
+var
+  Files: TDictionary<Cardinal, TFileCost>;
+  Evs: TList<TTCRevision>;
+  Times: TArray<Int64>;      // Evs' times, as the branch's commit times are kept
+  Firsts: TDictionary<Cardinal, Int64>;
+  Extra: TArray<Int64>;      // when the branch first has each file the label does not hold
+  X: Integer;
+  R: TTCRevision;
+  Fc: TFileCost;
+  L: string;
+  Id: Cardinal;
+  Total, Best, I, J, E, BestI: Integer;
+  T, BestCut: Int64;
+  Ok: Boolean;
+
+  function CostOf(const F: TFileCost): Integer;
+  var
+    S: string;
+  begin
+    if F.Cur = '' then Exit(F.Line.Count);
+    if F.Line.IndexOf(F.Cur) >= 0 then
+    begin
+      Result := 0;
+      for S in F.Line do
+        if (S <> F.Cur) and RevOnLine(F.Cur, S) then Inc(Result);
+    end
+    else Result := 1 + F.Later;
+  end;
+
+begin
+  AttachPoint(0);   // loads the branch's first-parent line
+  if Length(FBranchShas) = 0 then
+  begin
+    Cut := Low(Int64);
+    Exit('');
+  end;
+  Files := TDictionary<Cardinal, TFileCost>.Create;
+  Evs := TList<TTCRevision>.Create;
+  try
+    Total := 0;
+    for R in FSession.Revisions do
+    begin
+      if not AtLabel.TryGetValue(R.FileID, L) then Continue;
+      Ok := RevOnLine(R.Revision, L);
+      if not Ok and not InMain(R) then Continue;    // touches neither the line nor the branch
+      if not Files.TryGetValue(R.FileID, Fc) then
+      begin
+        Fc.Line := TList<string>.Create;
+        Fc.Later := 0;
+        Fc.Cur := '';
+        Fc.Cost := 0;
+      end;
+      if Ok then
+      begin
+        Fc.Line.Add(R.Revision);
+        Inc(Fc.Later);
+      end;
+      Files.AddOrSetValue(R.FileID, Fc);
+      Evs.Add(R);
+    end;
+    // A file the label does not hold that the branch already has at the fork is one more the
+    // closing commit removes, so it is costed from the branch's first revision of it. Files no
+    // label ever held cost the same at every fork; the term is what keeps a fork from being
+    // chosen after years of files the release never had: V6.0.0 forked at the branch's tip
+    // without it, and its closing commit removed 2,401 files.
+    Firsts := TDictionary<Cardinal, Int64>.Create;
+    try
+      for R in FSession.Revisions do
+        if not AtLabel.ContainsKey(R.FileID) and InMain(R) then
+        begin
+          T := DateTimeToUnix(R.When, True);
+          if not Firsts.TryGetValue(R.FileID, BestCut) or (T < BestCut) then
+            Firsts.AddOrSetValue(R.FileID, T);
+        end;
+      Extra := Firsts.Values.ToArray;
+    finally
+      Firsts.Free;
+    end;
+    TArray.Sort<Int64>(Extra);
+    X := 0;
+    for Fc in Files.Values do Inc(Total, Fc.Line.Count);   // nothing forked: all replayed
+    Evs.Sort(TComparer<TTCRevision>.Construct(
+      function(const A, B: TTCRevision): Integer
+      begin
+        Result := CompareDateTime(A.When, B.When);
+      end));
+    for Id in Files.Keys.ToArray do   // each file starts at its whole line, as Total does
+    begin
+      Fc := Files[Id];
+      Fc.Cost := Fc.Line.Count;
+      Files[Id] := Fc;
+    end;
+
+    // the root ('' fork) costs Total; then each commit from the oldest, then the tip
+    Best := Total;
+    BestI := Length(FBranchShas);       // = no shared commit
+    BestCut := Low(Int64);
+    SetLength(Times, Evs.Count);
+    for E := 0 to Evs.Count - 1 do Times[E] := DateTimeToUnix(Evs[E].When, True);
+    E := 0;
+    GStage := GStage + Format(' (%d revision(s), %d commit(s))', [Evs.Count, Length(FBranchShas)]);
+    for I := High(FBranchShas) downto -1 do
+    begin
+      // fork = FBranchShas[I+1] holds everything dated before FBranchTimes[I]; I = -1 is the tip
+      if I >= 0 then T := FBranchTimes[I] else T := High(Int64);
+      if I + 1 > High(FBranchShas) then Continue;   // the root is costed above
+      // the bound is tested on its own: written as one "(E < Count) and (Evs[E]...)" condition
+      // it read Evs[Count] here, though the same loop over a list of a smaller record does not
+      while E < Evs.Count do
+      begin
+        if Times[E] >= T then Break;
+        R := Evs[E];
+        Inc(E);
+        Fc := Files[R.FileID];
+        if Fc.Line.IndexOf(R.Revision) >= 0 then Dec(Fc.Later);
+        if InMain(R) then Fc.Cur := R.Revision;
+        J := CostOf(Fc);
+        Inc(Total, J - Fc.Cost);
+        Fc.Cost := J;
+        Files[R.FileID] := Fc;
+      end;
+      while (X < Length(Extra)) and (Extra[X] < T) do
+      begin
+        Inc(Total);
+        Inc(X);
+      end;
+      if Total <= Best then
+      begin
+        Best := Total;
+        BestI := I + 1;
+        BestCut := T;
+      end;
+    end;
+    Cut := BestCut;
+    if BestI > High(FBranchShas) then Result := '' else Result := FBranchShas[BestI];
+  finally
+    for Fc in Files.Values do Fc.Line.Free;
+    Files.Free;
+    Evs.Free;
+  end;
+end;
+
+function TPipeline.ReplayRevisions(const Base: string; Revs: TArray<TTCRevision>;
+  out Commits: Integer): string;
+// Commits Revs, oldest first and grouped into check-ins exactly as the branch's are, on top of
+// Base ('' = a new root). Written through a scratch ref, so nothing visible moves until the
+// caller moves a branch to the result. Returns the last commit, or Base when nothing changed.
+const
+  Scratch = 'refs/tc2git/replay';
+var
+  GitProc: TProcessInformation;
+  GitIn: THandle;
+  FS: TStream;
+  Marks: TDictionary<string, Integer>;
+  Index: TObjectDictionary<string, TList<Integer>>;
+  Pending: TList<TChange>;
+  Holds: TDictionary<string, string>;      // path -> sha this replay last wrote there
+  GroupFiles: TDictionary<Cardinal, Boolean>;
+  Shas: TStringList;
+  Lst: TList<Integer>;
+  Chg: TChange;
+  Rev: TTCRevision;
+  GroupAuthor, GroupComment, Msg, Out1, Was: string;
+  GroupStart: TDateTime;
+  N, Mark: Integer;
+  First: Boolean;
+
+  procedure Flush;
+  var
+    K: Integer;
+  begin
+    if Pending.Count = 0 then Exit;
+    Inc(Commits);
+    Msg := GroupComment;
+    if Trim(Msg) = '' then Msg := '(no check-in comment)';
+    PutLine(FS, 'commit ' + Scratch);
+    PutLine(FS, Format('committer %s %s', [MapAuthor(GroupAuthor), GitStamp(GroupStart)]));
+    PutLine(FS, 'data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
+    PutLine(FS, Msg);
+    if First and (Base <> '') then PutLine(FS, 'from ' + Base);
+    First := False;
+    for K := 0 to Pending.Count - 1 do
+      PutLine(FS, Format('M 100644 :%d %s', [Pending[K].Mark, Pending[K].Path]));
+    Pending.Clear;
+  end;
+
+begin
+  Commits := 0;
+  Result := Base;
+  if Length(Revs) = 0 then Exit;
+  SortChronologically(Revs);
+  Marks := TDictionary<string, Integer>.Create;
+  Index := BlobIndex;
+  Pending := TList<TChange>.Create;
+  Holds := TDictionary<string, string>.Create;
+  GroupFiles := TDictionary<Cardinal, Boolean>.Create;
+  Shas := TStringList.Create;
+  try
+    for Rev in Revs do
+      if Index.TryGetValue(Format('%d|%s', [Rev.FileID, Rev.Revision]), Lst) then
+        for N in Lst do Shas.Add(FBlobs[N].Sha);
+    PrepareFiltered(Shas.ToStringArray);
+    GitOut('update-ref -d ' + Scratch, Out1);
+
+    GitIn := 0;
+    if not StartFastImport(GitProc, GitIn, True) then
+      raise Exception.Create('Could not start git fast-import for a release branch.');
+    FS := THandleStream.Create(GitIn);
+    try
+      Mark := 0;
+      First := True;
+      GroupAuthor := #0;
+      GroupComment := #0;
+      GroupStart := 0;
+      for Rev in Revs do
+      begin
+        if Cancelled then Break;
+        // the same boundaries as ImportRange, including a new commit when a file repeats
+        if (Rev.Author <> GroupAuthor) or (Rev.Comment <> GroupComment) or
+           ((FOpt.WindowSeconds > 0) and
+            (SecondsBetween(Rev.When, GroupStart) > FOpt.WindowSeconds)) or
+           GroupFiles.ContainsKey(Rev.FileID) then
+        begin
+          Flush;
+          GroupFiles.Clear;
+          GroupAuthor := Rev.Author;
+          GroupComment := Rev.Comment;
+          GroupStart := Rev.When;
+        end;
+        GroupFiles.AddOrSetValue(Rev.FileID, True);
+        if not Index.TryGetValue(Format('%d|%s', [Rev.FileID, Rev.Revision]), Lst) then Continue;
+        for N in Lst do
+        begin
+          Chg.Path := MemberPath(Rev.TCPath, FBlobs[N].Member);
+          Chg.Sha := FBlobs[N].Sha;
+          if Holds.TryGetValue(Chg.Path, Was) and (Was = Chg.Sha) then Continue;
+          if not EmitBlob(FS, FBlobs[N], Chg.Path, Marks, Mark, Chg.Mark) then Continue;
+          Holds.AddOrSetValue(Chg.Path, Chg.Sha);
+          Pending.Add(Chg);
+        end;
+      end;
+      Flush;
+    finally
+      FS.Free;
+    end;
+    if FinishFastImport(GitProc, GitIn, Out1) <> 0 then
+    begin
+      Log('git fast-import FAILED on a release branch:');
+      Log(Out1);
+      raise Exception.Create('git fast-import failed while building a release branch.');
+    end;
+    if Commits > 0 then
+    begin
+      Result := RefSha(Scratch);
+      if Result = '' then raise Exception.Create('The replayed history was not written.');
+    end;
+    GitOut('update-ref -d ' + Scratch, Out1);
+  finally
+    Shas.Free;
+    GroupFiles.Free;
+    Holds.Free;
+    Pending.Free;
+    Index.Free;
+    Marks.Free;
+  end;
+end;
+
 procedure TPipeline.UpdateReleaseBranches;
 type
   TRel = record
     Name, Branch, Tag, Tip, StateTag, StateTip: string;
-    Managed: Boolean;
+    Managed, Rebuilt: Boolean;
   end;
 var
-  Out1, Line, Remote, New, Msg: string;
+  Out1, Line, Remote, New, Msg, Was: string;
+  Seen: TDictionary<string, string>;   // branch -> its remote-tracking sha before this fetch
   Names: TList<string>;
   Rels: TArray<TRel>;
   State: TDictionary<string, TArray<string>>;
@@ -3762,9 +4347,12 @@ var
   Parts: TArray<string>;
   Skips: TArray<string>;
   Mask: string;
-  I, Prev, Created, Advanced, Recorded: Integer;
+  I, Prev, Created, Advanced, Recorded, Rebuilt, N: Integer;
   Skip: Boolean;
   Id: TArray<string>;
+  LabelIds: TDictionary<string, Cardinal>;    // tag name -> the TC version label it was made from
+  Lb: TTCLabel;
+  AtLabel, Cur: TDictionary<Cardinal, string>;
 
   function StatePathRel: string;
   begin
@@ -3794,17 +4382,118 @@ var
       raise Exception.Create('Cannot read the label commit ' + Commit);
   end;
 
+  // file id -> the revision a label holds of it
+  function AttachMap(ID: Cardinal; const Att: TArray<TTCAttachment>): TDictionary<Cardinal, string>;
+  var
+    A: TTCAttachment;
+  begin
+    Result := TDictionary<Cardinal, string>.Create;
+    for A in Att do
+      if A.LabelID = ID then Result.AddOrSetValue(A.FileID, A.Revision);
+  end;
+
+  // Replays, on Base, the check-ins on the label's line that come after what Base holds of each
+  // file - Cur, a file's revision in Base. A file Base holds off the line gets the revisions
+  // from Cut on; with NewFilesFull a file Base lacks gets its whole line. Then, when the result
+  // is not exactly the label, one commit makes it so: it drops files the label does not hold
+  // and sets any whose revisions could not all be replayed. With no AtLabel, only that commit.
+  function History(const R: TRel; const Base: string; Cur, AtLabel: TDictionary<Cardinal, string>;
+    Cut: Int64; NewFilesFull: Boolean; out Commits: Integer): string;
+  var
+    Revs: TList<TTCRevision>;
+    Rv: TTCRevision;
+    L, C, Tip, TagTree, O: string;
+    Id: TArray<string>;
+    Diff: Integer;
+  begin
+    Commits := 0;
+    Tip := Base;
+    if AtLabel <> nil then
+    begin
+      Revs := TList<TTCRevision>.Create;
+      try
+        for Rv in FSession.Revisions do
+        begin
+          if not AtLabel.TryGetValue(Rv.FileID, L) or not RevOnLine(Rv.Revision, L) then Continue;
+          if Cur.TryGetValue(Rv.FileID, C) then
+          begin
+            if RevOnLine(C, L) then
+            begin
+              if (Rv.Revision = C) or not RevOnLine(C, Rv.Revision) then Continue;
+            end
+            else if DateTimeToUnix(Rv.When, True) < Cut then Continue;
+          end
+          else if not NewFilesFull then Continue;
+          Revs.Add(Rv);
+        end;
+        GStage := Format('%s: replaying %d revision(s)', [R.Branch, Revs.Count]);
+        Tip := ReplayRevisions(Base, Revs.ToArray, Commits);
+        GStage := R.Branch + ': the closing commit';
+      finally
+        Revs.Free;
+      end;
+    end;
+    TagTree := TreeOf(R.Tag);
+    if (Tip <> '') and (TreeOf(Tip) = TagTree) then Exit(Tip);
+    Id := LabelIdent(R.Tag);
+    Diff := 0;
+    if (Tip <> '') and (GitOut(Format('diff-tree -r --no-renames --name-only %s %s',
+                        [Tip, R.Tag]), O) = 0) then
+      Diff := Length(O.Split([#10], TStringSplitOptions.ExcludeEmpty));
+    O := Format('Match label %s as Team Coherence has it'#10#10 +
+      '%d file(s) differ from the revisions label %s holds: files it does not hold are ' +
+      'removed, and any file whose check-ins could not all be replayed here is set to the ' +
+      'label''s revision.'#10, [R.Name, Diff, R.Name]);
+    if Tip = '' then Result := CommitTree(TagTree, [], O, 'tc2git', 'tc2git@localhost', Id[2])
+    else Result := CommitTree(TagTree, [Tip], O, 'tc2git', 'tc2git@localhost', Id[2]);
+  end;
+
+  // A release built from where it leaves the branch: the branch's history up to there, then
+  // every check-in on the label's line that the branch does not have.
+  function FromFork(const R: TRel; LabelID: Cardinal; out Commits: Integer): string;
+  var
+    AtLabel, Cur: TDictionary<Cardinal, string>;
+    Newest: TDictionary<Cardinal, TTCRevision>;
+    Rv, Was: TTCRevision;
+    Fork: string;
+    Cut: Int64;
+  begin
+    AtLabel := AttachMap(LabelID, FSession.Attachments.ToArray);
+    Cur := TDictionary<Cardinal, string>.Create;
+    Newest := TDictionary<Cardinal, TTCRevision>.Create;
+    try
+      GStage := R.Branch + ': choosing the fork';
+      Fork := ForkPoint(AtLabel, Cut);
+      GStage := R.Branch + ': what the fork holds';
+      // what the fork holds of each of the label's files: the branch's newest revision before Cut
+      for Rv in FSession.Revisions do
+        if AtLabel.ContainsKey(Rv.FileID) and InMain(Rv) and
+           (DateTimeToUnix(Rv.When, True) < Cut) then
+          if not Newest.TryGetValue(Rv.FileID, Was) or (CompareDateTime(Rv.When, Was.When) > 0) then
+            Newest.AddOrSetValue(Rv.FileID, Rv);
+      for Rv in Newest.Values do Cur.AddOrSetValue(Rv.FileID, Rv.Revision);
+      Result := History(R, Fork, Cur, AtLabel, Cut, True, Commits);
+    finally
+      Newest.Free;
+      Cur.Free;
+      AtLabel.Free;
+    end;
+  end;
+
 begin
   if not FOpt.IncludeTags then
     raise EUpdateRefused.Create('Release branches are built from the version labels: they ' +
       'need --tags as well.');
   FReleasePush.Clear;
+  EnsureMainLine;   // which revisions the branch holds decides where each release leaves it
   Skips := FOpt.ReleaseSkip.Split([';'], TStringSplitOptions.ExcludeEmpty);
 
   // ---- which labels get a branch, oldest version first --------------------------------
+  LabelIds := TDictionary<string, Cardinal>.Create;
   Names := TList<string>.Create;
   State := TDictionary<string, TArray<string>>.Create;
   Diverged := TDictionary<string, Boolean>.Create;
+  Seen := TDictionary<string, string>.Create;
   Behind := TStringList.Create;
   Rows := TStringList.Create;
   try
@@ -3842,6 +4531,16 @@ begin
     EnsureRemote;
     if RemoteExists then
     begin
+      // where each branch stood on the remote when this repository last fetched or pushed it
+      if GitOut(Format('for-each-ref --format=%%(refname):%%(objectname) refs/remotes/%s/%s',
+                [FOpt.Remote, ReleasePrefix]), Out1) = 0 then
+        for Line in Out1.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+        begin
+          Parts := Trim(Line).Split([':']);   // ':' cannot be in a ref name; a space splits the argument
+          if Length(Parts) = 2 then
+            Seen.AddOrSetValue(Copy(Parts[0], Length('refs/remotes/' + FOpt.Remote + '/') + 1,
+              MaxInt), Parts[1]);
+        end;
       Log(Format('Fetching %s* from %s...', [ReleasePrefix, FOpt.Remote]));
       if GitOut(Format('fetch --no-tags %s +refs/heads/%s*:refs/remotes/%s/%s*',
                 [FOpt.Remote, ReleasePrefix, FOpt.Remote, ReleasePrefix]), Out1, 3600) <> 0 then
@@ -3857,6 +4556,7 @@ begin
       Rels[I].Tag := RefSha('refs/tags/' + Names[I]);
       Rels[I].Tip := RefSha('refs/heads/' + Rels[I].Branch);
       Rels[I].Managed := True;
+      Rels[I].Rebuilt := False;
       if State.ContainsKey(Names[I]) then
       begin
         Rels[I].StateTag := State[Names[I]][0];
@@ -3872,6 +4572,15 @@ begin
             Log(Format('  %s: brought up to %s from %s', [Rels[I].Branch, Copy(Remote, 1, 8),
               FOpt.Remote]));
           end
+          else if not IsAncestor(Remote, Rels[I].Tip) and Seen.TryGetValue(Rels[I].Branch, Was) and
+                  (Was = Remote) and (Rels[I].Tip = Rels[I].StateTip) then
+          begin
+            // tc2git rewrote it here (a rebuild) and that never reached the remote, which has
+            // not moved since: nobody else's work is in the way, so it is pushed with a lease
+            Rels[I].Rebuilt := True;
+            Log(Format('  %s: rewritten here by tc2git and not yet pushed; %s has not moved ' +
+              'since, so the push replaces it', [Rels[I].Branch, FOpt.Remote]));
+          end
           else if not IsAncestor(Remote, Rels[I].Tip) then
           begin
             Log(Format('*** %s here and on %s have both changed; it is left alone this run. ' +
@@ -3885,15 +4594,45 @@ begin
     // ---- each branch exists and holds its label --------------------------------------------
     Created := 0;
     Advanced := 0;
+    Rebuilt := 0;
+    for Lb in FSession.Labels do
+      if (Lb.LabelType = 1) and not LabelIds.ContainsKey(SanitiseRefName(Lb.Name)) then
+        LabelIds.Add(SanitiseRefName(Lb.Name), Lb.ID);
     for I := 0 to High(Rels) do
     begin
       if not Rels[I].Managed then Continue;
+      // --rebuild-release-branches: a branch tc2git owns is built again from TC's history. One
+      // somebody has committed to is theirs, and is left as it is.
+      if FOpt.RebuildReleaseBranches and (Rels[I].Tip <> '') and LabelIds.ContainsKey(Rels[I].Name) then
+      begin
+        if (Rels[I].StateTip <> '') and (Rels[I].Tip <> Rels[I].StateTip) then
+          Log(Format('*** %s has commits made in git; not rebuilt.', [Rels[I].Branch]))
+        else
+        begin
+          New := FromFork(Rels[I], LabelIds[Rels[I].Name], N);
+          MoveBranch(Rels[I], New, True);
+          Rels[I].StateTag := Rels[I].Tag;
+          Rels[I].Rebuilt := True;
+          Inc(Rebuilt);
+          Log(Format('  %s rebuilt: %d check-in(s) made under its view', [Rels[I].Branch, N]));
+        end;
+        Continue;
+      end;
       if Rels[I].Tip = '' then
       begin
-        MoveBranch(Rels[I], Rels[I].Tag, True);
+        if LabelIds.ContainsKey(Rels[I].Name) then
+        begin
+          New := FromFork(Rels[I], LabelIds[Rels[I].Name], N);
+          MoveBranch(Rels[I], New, True);
+          Log(Format('  %s created: %d check-in(s) made under its view', [Rels[I].Branch, N]));
+        end
+        else
+        begin
+          MoveBranch(Rels[I], Rels[I].Tag, True);   // a tag with no label left: its snapshot
+          Log(Format('  %s created from %s', [Rels[I].Branch, Rels[I].Name]));
+        end;
         Rels[I].StateTag := Rels[I].Tag;
         Inc(Created);
-        Log(Format('  %s created from %s', [Rels[I].Branch, Rels[I].Name]));
       end
       else if Rels[I].StateTip = '' then
       begin
@@ -3922,16 +4661,26 @@ begin
         end
         else if Rels[I].Tip = Rels[I].StateTip then
         begin
-          Id := LabelIdent(Rels[I].Tag);
-          New := CommitTree(TreeOf(Rels[I].Tag), [Rels[I].Tip],
-            Format('%s re-applied in Team Coherence'#10#10 +
-              'The files of label %s as Team Coherence now has them.'#10,
-              [Rels[I].Name, Rels[I].Name]), 'tc2git', 'tc2git@localhost', Id[2]);
+          // the check-ins made under its view since, then whatever else the label changed
+          N := 0;
+          if LabelIds.ContainsKey(Rels[I].Name) then
+          begin
+            AtLabel := AttachMap(LabelIds[Rels[I].Name], FSession.Attachments.ToArray);
+            Cur := AttachMap(LabelIds[Rels[I].Name], FOldAttach);
+            try
+              New := History(Rels[I], Rels[I].Tip, Cur, AtLabel, High(Int64), False, N);
+            finally
+              Cur.Free;
+              AtLabel.Free;
+            end;
+          end
+          else
+            New := History(Rels[I], Rels[I].Tip, nil, nil, High(Int64), False, N);
           MoveBranch(Rels[I], New, True);
           Rels[I].StateTag := Rels[I].Tag;
           Inc(Advanced);
-          Log(Format('  %s moved forward: label %s was re-applied in TC',
-            [Rels[I].Branch, Rels[I].Name]));
+          Log(Format('  %s moved forward: label %s changed in TC (%d check-in(s) under its view)',
+            [Rels[I].Branch, Rels[I].Name, N]));
         end
         else
         begin
@@ -3947,6 +4696,7 @@ begin
     end;
 
     // ---- each branch records the one before as included ------------------------------------
+    GStage := 'recording which release includes which';
     Recorded := 0;
     Prev := -1;
     for I := 0 to High(Rels) do
@@ -3968,11 +4718,12 @@ begin
     end;
 
     // ---- remember, report ---------------------------------------------------------------------
+    GStage := '';
     for I := 0 to High(Rels) do
       if Rels[I].Managed then
       begin
         Rows.Add(Format('%s,%s,%s', [Rels[I].Name, Rels[I].StateTag, Rels[I].StateTip]));
-        FReleasePush.Add(Rels[I].Branch);
+        FReleasePush.AddObject(Rels[I].Branch, TObject(NativeUInt(Ord(Rels[I].Rebuilt))));
       end
       else if State.ContainsKey(Rels[I].Name) then
         Rows.Add(Format('%s,%s,%s', [Rels[I].Name, State[Rels[I].Name][0],
@@ -3995,13 +4746,15 @@ begin
         if not Names.Contains(Copy(Trim(Line), Length(ReleasePrefix) + 1, MaxInt)) then
           Log(Format('  %s matches no version label here and was left in place', [Trim(Line)]));
 
-    Log(Format('Release branches: %d, of which %d new, %d moved forward from TC, %d inclusion ' +
-      'record(s) added; %d left alone.', [FReleasePush.Count, Created, Advanced, Recorded,
-      Length(Rels) - FReleasePush.Count]));
+    Log(Format('Release branches: %d, of which %d new, %d rebuilt, %d moved forward from TC, ' +
+      '%d inclusion record(s) added; %d left alone.', [FReleasePush.Count, Created, Rebuilt,
+      Advanced, Recorded, Length(Rels) - FReleasePush.Count]));
   finally
+    LabelIds.Free;
     Rows.Free;
     Behind.Free;
     Diverged.Free;
+    Seen.Free;
     State.Free;
     Names.Free;
   end;
@@ -4077,14 +4830,77 @@ begin
     raise Exception.Create('git push of the branch failed:'#13#10 + Trim(Out1));
 end;
 
+procedure TPipeline.PushLfsObjects;
+// The first push to a remote URL uploads every LFS object the history references (lfs push
+// --all), which reads every commit - minutes on a long history even when nothing is missing.
+// After that, meta\lfs_pushed.<remote>.txt holds the URL it went to, and a push uploads only
+// the objects stored since, which meta\lfs_pending.txt lists as they are written. A remote whose
+// URL has changed gets a full push again; deleting the marker file forces one.
+const
+  Chunk = 100;   // object ids per command line: 65 characters each, well inside the limit
+var
+  Marker, PendFile, Url, Out1, Args, Line: string;
+  Pending: TStringList;
+  I: Integer;
+begin
+  PendFile := TPath.Combine(FOpt.MetaDir, 'lfs_pending.txt');
+  Marker := TPath.Combine(FOpt.MetaDir, 'lfs_pushed.' + FOpt.Remote + '.txt');
+  if GitOut(Format('remote get-url %s', [FOpt.Remote]), Url) <> 0 then
+    raise Exception.Create('git remote get-url failed:'#13#10 + Trim(Url));
+  Url := Trim(Url);
+  if not (TFile.Exists(Marker) and SameText(Trim(TFile.ReadAllText(Marker)), Url)) then
+  begin
+    // Not pushed to this URL by this version yet: everything, once, if the history uses LFS.
+    if Length(FLfsPatterns) > 0 then
+    begin
+      Log(Format('Uploading all LFS objects to %s (first push to this URL)...', [FOpt.Remote]));
+      if GitOut(Format('lfs push --all %s', [FOpt.Remote]), Out1, 6 * 3600) <> 0 then
+        raise Exception.Create('git lfs push failed:'#13#10 + Trim(Out1));
+    end;
+  end
+  else if TFile.Exists(PendFile) then
+  begin
+    Pending := TStringList.Create;
+    try
+      Pending.Sorted := True;
+      Pending.Duplicates := dupIgnore;
+      for Line in TFile.ReadAllLines(PendFile) do
+        if Trim(Line) <> '' then Pending.Add(Trim(Line));
+      Log(Format('Uploading %d new LFS object(s) to %s...', [Pending.Count, FOpt.Remote]));
+      I := 0;
+      while I < Pending.Count do
+      begin
+        Args := '';
+        while (I < Pending.Count) and (Length(Args) < Chunk * 65) do
+        begin
+          Args := Args + ' ' + Pending[I];
+          Inc(I);
+        end;
+        if GitOut(Format('lfs push --object-id %s%s', [FOpt.Remote, Args]), Out1,
+                  6 * 3600) <> 0 then
+          raise Exception.Create('git lfs push failed:'#13#10 + Trim(Out1));
+      end;
+    finally
+      Pending.Free;
+    end;
+  end
+  else
+    Log('No new LFS objects to upload.');
+  // Only once every upload above has succeeded: a failure leaves the list for the next push.
+  if TFile.Exists(PendFile) then TFile.Delete(PendFile);
+  TFile.WriteAllText(Marker, Url, TEncoding.ASCII);
+end;
+
 procedure TPipeline.PushToRemote;
 // The branch is pushed WITHOUT force: the update checked the remote is at or behind this
 // repository, so a rejection means someone pushed in the meantime - a reason to stop, never to
 // overwrite. Tags are pushed with force, because a label re-applied in TC moves its tag. Release
-// branches only ever move forward, so they are pushed without force too.
+// branches only ever move forward, so they are pushed without force too - except one
+// --rebuild-release-branches has just rebuilt.
 var
-  Out1, Refs: string;
+  Out1, Refs, Lease: string;
   B: string;
+  I: Integer;
 begin
   SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0');
   EnsureRemote;
@@ -4093,12 +4909,7 @@ begin
       'git -C "%s" remote add %s <url>', [FOpt.Remote, FOpt.RepoDir, FOpt.Remote]);
   // LFS content first: a bare repository has no hook to upload it, and a pushed pointer whose
   // object never arrived is a file nobody can check out.
-  if Length(FLfsPatterns) > 0 then
-  begin
-    Log(Format('Uploading LFS objects to %s...', [FOpt.Remote]));
-    if GitOut(Format('lfs push --all %s', [FOpt.Remote]), Out1, 6 * 3600) <> 0 then
-      raise Exception.Create('git lfs push failed:'#13#10 + Trim(Out1));
-  end;
+  PushLfsObjects;
   Log(Format('Pushing %s to %s...', [FOpt.Branch, FOpt.Remote]));
   PushBranchInSteps(FOpt.Branch);
   if FOpt.IncludeTags then
@@ -4112,8 +4923,19 @@ begin
   begin
     Log(Format('Pushing %d release branch(es) to %s...', [FReleasePush.Count, FOpt.Remote]));
     Refs := '';
-    for B in FReleasePush do Refs := Refs + Format(' refs/heads/%s:refs/heads/%s', [B, B]);
-    if GitOut(Format('push --porcelain %s%s', [FOpt.Remote, Refs]), Out1, 6 * 3600) <> 0 then
+    Lease := '';
+    // A rebuilt branch replaces what is published, so it goes with force - but only over what
+    // this run fetched: someone pushing to it since makes the push fail, not vanish.
+    for I := 0 to FReleasePush.Count - 1 do
+    begin
+      B := FReleasePush[I];
+      Refs := Refs + Format(' refs/heads/%s:refs/heads/%s', [B, B]);
+      if FReleasePush.Objects[I] <> nil then
+        Lease := Lease + Format(' --force-with-lease=refs/heads/%s:%s', [B,
+          RefSha(Format('refs/remotes/%s/%s', [FOpt.Remote, B]))]);
+    end;
+    if GitOut(Format('push --porcelain%s %s%s', [Lease, FOpt.Remote, Refs]), Out1,
+              6 * 3600) <> 0 then
       raise Exception.Create('git push of the release branches failed (someone may have ' +
         'pushed to one since this run fetched them; run again):'#13#10 + Trim(Out1));
   end;

@@ -58,7 +58,7 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--work <dir>` | Working folder |
 | `--projects <ids>` | Comma-separated project ids, e.g. `10014,10015`. Omit for all |
 | `--limit <n>` | **Test run**: use only the first *n* files. `0` = all |
-| `--no-tags` / `--tags` | Whether to rebuild version labels as tags |
+| `--no-tags` / `--tags` | Whether to rebuild version labels as tags. Promotion levels become tags too, under `promotion/` - written the same way but **not yet tested against a repository that uses them** |
 | `--branch <name>` | Target branch |
 | `--window <seconds>` | Check-in grouping window |
 | `--authors <file>` | Author map |
@@ -72,6 +72,9 @@ TCMigrator.exe --auto --work C:\tc-migration-test --projects 10014 --limit 25 --
 | `--remote-url <url>` | The remote's URL. Added to the repository when it has no such remote; a remote that already points elsewhere stops the run rather than being changed |
 | `--release-branches` | Keep a `release/<label>` branch for every version label, chained so a fix merges forward. Needs `--tags`. See *Release branches* |
 | `--release-skip <masks>` | `;`-separated masks of labels that get no release branch - typically the label on the version still being built, which is the branch itself |
+| `--rebuild-release-branches` | Build every release branch tc2git owns again from TC's history, and push those with force (over only what the run fetched). For moving branches made by an earlier version onto per-check-in history. See *Release branches* |
+| `--main-line <label>` | The version label whose view the branch follows, e.g. `V7.0.0`. Fixes checked in under other releases' views stay off the branch. Needs `--tags`. See *Views and the branch* |
+| `--offline` | For testing changes to tc2git: an `--update` from the metadata the last run saved in `meta\`, without connecting to TC - no login, no history read, no search for deleted files. Run it on a copy of the work folder: it moves branches and the checkpoint like any update. Cannot be combined with `--push` |
 | `--state <file>` | The migration's checkpoint file, when it is not `state.txt` in the work folder. Only a first `--update` reads it |
 | `--filter <script>` | A content filter every file passes through before it reaches git - for a published history that was redacted. Run with one argument, a list file of `<input>TAB<output>` lines. A `.pl` script runs under Git for Windows' Perl; `tools\filters\redact-blobs.pl` applies a `rules.pl` of your own |
 | `--exclude <masks>` | `;`-separated masks of paths never written to git, e.g. `*.pfx` |
@@ -125,10 +128,13 @@ What an update does:
    revision whose label count has not changed keeps its earlier answer, so only the rest are
    asked.
 5. **Follows moves and renames** as one commit, with the content each file already had.
+   With `--main-line`, also puts any file back on that label's line, again as one commit - see
+   *Views and the branch*.
 6. **Adds the new check-ins**, grouped as in a migration, in batches with the ledger
    checkpointed after each. A revision that would write content a path already holds is left
    out. A revision older than one of the same file already in git is not added - it would put
-   old content over new - and is listed in `meta\update_behind.csv`.
+   old content over new - and is listed in `meta\update_behind.csv`. With `--main-line`, a
+   revision checked in under another release's view is fetched but not added.
 7. **Rebuilds the tags.** A label re-applied in TC moves its tag; a label deleted in TC leaves
    its tag, which is listed in the log for a person to decide about. A moved tag keeps its
    place on the branch (its parent), and a tag written as a root commit by an earlier version
@@ -149,7 +155,10 @@ put back what was taken out:
 - **Removed files:** `--exclude`, e.g. `*.pfx`.
 - **LFS:** read from the tip's `.gitattributes`; matching files are written as LFS pointers,
   their content stored in the repository's LFS store and uploaded by `git lfs push` before
-  the branch. A new file over GitHub's 100 MB limit that `.gitattributes` does not cover stops
+  the branch. The first push to a remote URL uploads everything (`--all`, which reads the
+  whole history: minutes on a long one); later pushes upload only the objects stored since,
+  listed in `meta\lfs_pending.txt`. `meta\lfs_pushed.<remote>.txt` records the URL the full
+  push went to - delete it to force another. A new file over GitHub's 100 MB limit that `.gitattributes` does not cover stops
   a `--push` run rather than fail the push.
 - **Dates:** commits carry the TC zone's own offset, as a history re-dated to that zone does.
 
@@ -166,6 +175,36 @@ What it cannot do:
 - **Move dates.** TC records none, so moves and deletions are committed when the update runs,
   not when they happened.
 
+## Views and the branch
+
+A Team Coherence **view** based on a version label shows each file at the revision the label
+holds. Checking a file in under that view makes a new revision after the label's - on a branch
+of the file's history (`1.49.1.0`, `1.49.1.1`, ...) when the trunk has moved on - and moves the
+label to it. So every view is a **line** of revisions per file: the label's revision and the
+revisions before it. `<default>` shows the newest revision on each file's trunk.
+
+Without `--main-line` the branch takes every revision in check-in order, whatever view it was
+checked in under. Where a fix for an older release was checked in after the newer work, the
+branch ends up with the fix in place of the newer work. On one repository that was 30 of the
+2,398 files the current version's label held.
+
+`--main-line <label>` makes the branch follow that label's view instead:
+
+- a file the label holds takes the revisions on the label's line, and newer ones that continue
+  it - unless another version label holds them, or a revision after them, because then they
+  were checked in under that label's view
+- a file the label does not hold takes every revision, as before
+- revisions kept off the branch are still fetched; each release branch is built from them
+
+```powershell
+.\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push `
+  -Branch main -MainLine 'V7.0.0' -ReleaseBranches -ReleaseSkip 'V7.0.0'
+```
+
+On an update the first run with `--main-line` puts back, in one commit, every file the branch
+holds off the line - the commit lists each path and its revision. A migration with it never
+takes them in the first place.
+
 ## Release branches
 
 `--release-branches` keeps a branch per version label, `release/<label>`, for fixing a released
@@ -173,8 +212,33 @@ version in git and carrying the fix up to the newer ones:
 
 ```powershell
 .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push `
-  -Branch main -ReleaseBranches -ReleaseSkip 'V7.0.0'
+  -Branch main -MainLine 'V7.0.0' -ReleaseBranches -ReleaseSkip 'V7.0.0'
 ```
+
+Each branch is that label's view as history: the branch's commits up to where the release
+leaves it, then every check-in on the label's line that the branch does not have - the fixes
+made under that release's view, each as its own commit with its author, date and comment. A
+last commit, `Match label X as Team Coherence has it`, makes the branch exactly the label where
+that history alone does not: it removes files the label does not hold and sets any revision that
+could not be fetched. So `git log release/V5.2.0` shows what was done for 5.2, and the branch
+tip is always exactly the label.
+
+Where a release leaves the branch is chosen by cost: of every commit on the branch, the one
+after which the release shares the most - the fewest revisions on the label's line left to
+replay, plus the files the closing commit has to change: those the branch had already taken off
+the line, and those it has that the label does not hold. The later commit wins a tie. Forking
+where the first file leaves the line instead lets one file the release kept at an old revision
+pull the fork back years: on one repository, to 2005 for every release, replaying up to 9,684
+check-ins the branch already had.
+
+A release whose view kept taking the branch's check-ins long after it was labelled forks late,
+and its history then holds the branch's work up to there. The closing commit lists what the
+release does not have of it. Forking at the label's creation instead was tried: it replayed the
+same work a second time under new commit ids - 756 of V6.0.0's 772 replayed commits were copies
+of the branch's.
+
+Merging forward was checked on the result: a fix committed on `release/V5.2.0`, merged into
+`release/V6.0.0` and then `release/V6.1.0`, changed only the fixed file each time.
 
 Labels whose names start with `v` or `V` and a digit get a branch; anything else
 (`zInvalidVersioning`) does not, nor does anything matching `--release-skip`. They are chained
@@ -206,12 +270,19 @@ must not happen in git while TC is in use - see *What it cannot do* above.
   re-applied in TC keeps the parent it had. A label written as a root commit shares no
   history with anything, and two branches with no common history cannot be merged usefully:
   every file conflicts.
-- **tc2git never forces a release branch.** It starts each one, and when a label is
-  re-applied in TC it moves that branch forward with one commit holding the label's new
-  files - but only while nobody has committed to the branch in git. If someone has, the branch
-  is left alone, the log says so, and `meta\release_behind.csv` lists it with the commands to
-  compare. Once a person has brought the label's changes in, the next run notices and carries
-  on.
+- **tc2git never forces a release branch** - except when asked to with
+  `--rebuild-release-branches`. It starts each one, and when a label changes in TC it moves
+  that branch forward with the check-ins made under its view since, and the matching commit if
+  one is needed - but only while nobody has committed to the branch in git. If someone has, the
+  branch is left alone, the log says so, and `meta\release_behind.csv` lists it with the
+  commands to compare. Once a person has brought the label's changes in, the next run notices
+  and carries on.
+- **`--rebuild-release-branches`** builds every branch tc2git owns again, as above, and pushes
+  each with `--force-with-lease` over what the run fetched - so a branch someone pushed to
+  meanwhile fails the push rather than losing their commit, and one with commits made in git is
+  not rebuilt at all. It is for moving branches made by an earlier version, which held each
+  label as a single snapshot, onto per-check-in history. A rule on the remote that blocks force
+  pushes to `release/*` has to be lifted for that one push.
 - **TC's own changes are not merged forward.** A fix TC makes to v6.0 reaches v6.1 when v6.1
   is re-labelled in TC, so the next branch only records it as included.
 - **The remote is read first.** Fixes are pushed to the remote by the people making them, so

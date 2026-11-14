@@ -25,6 +25,9 @@
   $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith
   $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags   # + labels
   $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push
+  # following one view, with a release branch per older label:
+  $env:TCPWD = '...'; .\Run-Migration.ps1 -Work D:\migration -User jsmith -Tags -Update -Push `
+    -Branch main -MainLine V7.0.0 -ReleaseBranches -ReleaseSkip V7.0.0
 
   Put the work folder on a volume with room for the blob cache AND the repository - about
   2.5x the size of the history. A 44,450-revision repository needed roughly 12 GB, and running
@@ -78,6 +81,10 @@ param(
   [switch] $ReleaseBranches,
   # ';'-separated masks of labels that get no release branch, e.g. the version still in work.
   [string] $ReleaseSkip = '',
+  # The version label whose view the branch follows, e.g. 'V7.0.0'. Needs -Tags.
+  [string] $MainLine = '',
+  # Build the release branches tc2git owns again from TC's history; pushed with force.
+  [switch] $RebuildReleaseBranches,
   [int]    $MaxAttempts = 400,
   [int]    $RetrySeconds = 60
 )
@@ -145,6 +152,8 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   if ($RemoteUrl) { $a += @('--remote-url', $RemoteUrl) }
   if ($ReleaseBranches) { $a += '--release-branches' }
   if ($ReleaseSkip) { $a += @('--release-skip', $ReleaseSkip) }
+  if ($MainLine) { $a += @('--main-line', $MainLine) }
+  if ($RebuildReleaseBranches) { $a += '--rebuild-release-branches' }
   $argLine = ($a | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
 
   $before = Get-Checkpoint

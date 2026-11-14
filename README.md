@@ -30,8 +30,12 @@ Every one of those comments describes something that actually happened.
 - **Updatable** — `--update` adds later TC check-ins on top of the published branch, after
   checking that every file at its tip is the content TC has for it, and `--push` publishes them,
   in steps when the history is over GitHub's 2 GB push limit
+- **Views** — `--main-line <label>` makes the branch follow one label's view, so fixes checked
+  in for older releases do not replace the newer work on it
 - **Release branches** — `--release-branches` keeps a `release/<label>` branch per version
-  label, chained so a fix made on an old release merges forward through every newer one
+  label: the check-ins made under that release's view, ending exactly at the label, chained so
+  a fix made on an old release merges forward through every newer one
+- **Promotion levels** — written as tags under `promotion/`
 
 ## Requirements
 
@@ -78,7 +82,10 @@ other is weak. A check against a number the server stated independently is stron
 
 Used successfully for one large migration. Not widely tested — expect to read the code.
 
-- **Views and promotion levels are not migrated.** TC views are enumerated but not turned into refs
+- **Views are migrated through their labels.** A view based on a version label becomes that
+  label's release branch; a view defined some other way (by project only) is not migrated
+- **Promotion levels have not been tested against real data.** The repository migrated so far
+  has none
 - Commit SHAs are not reproducible across runs (committer timestamps), so compare **trees**
 - Some revisions may be unrecoverable: this repository had 6 that failed identically through two
   independent access paths, which is TC's storage being damaged rather than a tool problem
