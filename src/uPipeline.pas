@@ -4399,12 +4399,15 @@ var
   // and sets any whose revisions could not all be replayed. With no AtLabel, only that commit.
   function History(const R: TRel; const Base: string; Cur, AtLabel: TDictionary<Cardinal, string>;
     Cut: Int64; NewFilesFull: Boolean; out Commits: Integer): string;
+  const
+    MaxListed = 500;
   var
     Revs: TList<TTCRevision>;
     Rv: TTCRevision;
-    L, C, Tip, TagTree, O: string;
+    L, C, Tip, TagTree, O, Ln: string;
     Id: TArray<string>;
-    Diff: Integer;
+    Removed, I: Integer;
+    Sets: TStringList;
   begin
     Commits := 0;
     Tip := Base;
@@ -4436,14 +4439,32 @@ var
     TagTree := TreeOf(R.Tag);
     if (Tip <> '') and (TreeOf(Tip) = TagTree) then Exit(Tip);
     Id := LabelIdent(R.Tag);
-    Diff := 0;
-    if (Tip <> '') and (GitOut(Format('diff-tree -r --no-renames --name-only %s %s',
-                        [Tip, R.Tag]), O) = 0) then
-      Diff := Length(O.Split([#10], TStringSplitOptions.ExcludeEmpty));
-    O := Format('Match label %s as Team Coherence has it'#10#10 +
-      '%d file(s) differ from the revisions label %s holds: files it does not hold are ' +
-      'removed, and any file whose check-ins could not all be replayed here is set to the ' +
-      'label''s revision.'#10, [R.Name, Diff, R.Name]);
+    // The files set are listed: they are what this release does not have of the branch's work
+    // (or a revision that could not be replayed), which is what someone reading the branch needs
+    // to see. Removals are only counted - they run to thousands, of files added after it.
+    Removed := 0;
+    Sets := TStringList.Create;
+    try
+      if (Tip <> '') and (GitOut(Format('diff-tree -r --no-renames --name-status %s %s',
+                          [Tip, R.Tag]), O) = 0) then
+        for Ln in O.Split([#10], TStringSplitOptions.ExcludeEmpty) do
+          if Ln.StartsWith('D') then Inc(Removed)
+          else if Pos(#9, Ln) > 0 then Sets.Add(Copy(Ln, Pos(#9, Ln) + 1, MaxInt));
+      O := Format('Match label %s as Team Coherence has it'#10#10, [R.Name]);
+      if Removed > 0 then
+        O := O + Format('%d file(s) removed that label %s does not hold.'#10, [Removed, R.Name]);
+      if Sets.Count > 0 then
+      begin
+        O := O + Format('%d file(s) set to the revision label %s holds - work the branch has ' +
+          'that this release does not, or a check-in that could not be replayed here:'#10#10,
+          [Sets.Count, R.Name]);
+        for I := 0 to Min(Sets.Count, MaxListed) - 1 do O := O + '  ' + Sets[I] + #10;
+        if Sets.Count > MaxListed then
+          O := O + Format('  ... and %d more'#10, [Sets.Count - MaxListed]);
+      end;
+    finally
+      Sets.Free;
+    end;
     if Tip = '' then Result := CommitTree(TagTree, [], O, 'tc2git', 'tc2git@localhost', Id[2])
     else Result := CommitTree(TagTree, [Tip], O, 'tc2git', 'tc2git@localhost', Id[2]);
   end;
