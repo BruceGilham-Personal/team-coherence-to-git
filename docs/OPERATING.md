@@ -128,7 +128,8 @@ What an update does:
    revision whose label count has not changed keeps its earlier answer, so only the rest are
    asked.
 5. **Follows moves and renames** as one commit, with the content each file already had.
-   With `--main-line`, also puts any file back on that label's line, again as one commit - see
+   With `--main-line`, also makes the branch hold what that label's view holds - files back on
+   its line, files it left out removed - again as one commit - see
    *Views and the branch*.
 6. **Adds the new check-ins**, grouped as in a migration, in batches with the ledger
    checkpointed after each. A revision that would write content a path already holds is left
@@ -191,9 +192,14 @@ branch ends up with the fix in place of the newer work. On one repository that w
 `--main-line <label>` makes the branch follow that label's view instead:
 
 - a file the label holds takes the revisions on the label's line, and newer ones that continue
-  it - unless another version label holds them, or a revision after them, because then they
-  were checked in under that label's view
-- a file the label does not hold takes every revision, as before
+  it and were checked in after the label was created - unless another version label holds
+  them, or a revision after them, because then they were checked in under that label's view. A
+  newer revision that already existed when the label was created was left out of it on purpose.
+- a file the label does not hold is on the branch only if it was added after the label was
+  created and no other version label holds it: new work in this view, not yet labelled. Files
+  that already existed and were left out of the label - old components, abandoned tools,
+  documents for earlier versions - stay off the branch. So new files appear on the branch
+  straight away, without waiting for the label to be re-applied.
 - revisions kept off the branch are still fetched; each release branch is built from them
 
 ```powershell
@@ -201,9 +207,12 @@ branch ends up with the fix in place of the newer work. On one repository that w
   -Branch main -MainLine 'V7.0.0' -ReleaseBranches -ReleaseSkip 'V7.0.0'
 ```
 
-On an update the first run with `--main-line` puts back, in one commit, every file the branch
-holds off the line - the commit lists each path and its revision. A migration with it never
-takes them in the first place.
+On an update, a run with `--main-line` makes the branch hold what the label's view holds, in
+one commit: it puts back every file the branch holds off the line and removes every file the
+rule above leaves out. The commit lists each path. The history and the older release branches
+keep what it removes, and nothing is force-pushed. A migration with it never takes them in the
+first place. On one repository the first such run removed 2,380 files: the branch had held
+everything TC still had, where the current version's label held 3,102.
 
 ## Release branches
 

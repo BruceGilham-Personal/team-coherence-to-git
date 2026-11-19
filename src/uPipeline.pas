@@ -149,8 +149,11 @@ type
     FMainLineOn: Boolean;
     FMainAt: TDictionary<Cardinal, string>;    // file id -> its revision in the main-line label
     FOtherAt: TDictionary<Cardinal, string>;   // file id -> other version labels' revisions, ';'
+    FFirstAt: TDictionary<Cardinal, TDateTime>; // file id -> when its first revision was checked in
+    FMainWhen: TDateTime;                      // when the main-line label was created
     procedure EnsureMainLine;
     function OnMainLine(const R: TTCRevision): Boolean;
+    function NewSinceMainLine(FileID: Cardinal): Boolean;
     function InMain(const R: TTCRevision): Boolean;
     function ForkPoint(const AtLabel: TDictionary<Cardinal, string>; out Cut: Int64): string;
     function ReplayRevisions(const Base: string; Revs: TArray<TTCRevision>;
@@ -288,10 +291,12 @@ begin
   FReleasePush := TStringList.Create;
   FMainAt := TDictionary<Cardinal, string>.Create;
   FOtherAt := TDictionary<Cardinal, string>.Create;
+  FFirstAt := TDictionary<Cardinal, TDateTime>.Create;
 end;
 
 destructor TPipeline.Destroy;
 begin
+  FFirstAt.Free;
   FOtherAt.Free;
   FMainAt.Free;
   FReleasePush.Free;
@@ -1953,10 +1958,13 @@ const
 var
   L: TTCLabel;
   A: TTCAttachment;
+  R: TTCRevision;
+  T: TDateTime;
   MainID: Cardinal;
   IsVersion: TDictionary<Cardinal, Boolean>;
   Found: Boolean;
   S: string;
+  Kept: Integer;
 begin
   if FMainLineOn or (FOpt.MainLine = '') then Exit;
   if not FOpt.IncludeTags then
@@ -1971,6 +1979,7 @@ begin
       if (L.LabelType = lt_VersionLabel) and SameText(L.Name, FOpt.MainLine) then
       begin
         MainID := L.ID;
+        FMainWhen := L.When;
         Found := True;
       end;
     end;
@@ -1994,24 +2003,47 @@ begin
   if FMainAt.Count = 0 then
     raise EUpdateRefused.CreateFmt('--main-line: label "%s" holds no revisions here.',
       [FOpt.MainLine]);
+  FFirstAt.Clear;
+  for R in FSession.Revisions do
+    if not FFirstAt.TryGetValue(R.FileID, T) or (CompareDateTime(R.When, T) < 0) then
+      FFirstAt.AddOrSetValue(R.FileID, R.When);
   FMainLineOn := True;
-  Log(Format('The branch follows label %s''s line: %d file(s) take the revision on its line; ' +
-    'files it does not hold take their newest revision.', [FOpt.MainLine, FMainAt.Count]));
+  Kept := 0;
+  for MainID in FFirstAt.Keys do
+    if not FMainAt.ContainsKey(MainID) and NewSinceMainLine(MainID) then Inc(Kept);
+  Log(Format('The branch follows label %s''s line: %d file(s) take the revision on its line. ' +
+    'Of the files it does not hold, %d were added since the label was created (%s) and are ' +
+    'kept; the rest stay off the branch.', [FOpt.MainLine, FMainAt.Count, Kept,
+    FormatDateTime('yyyy-mm-dd hh:nn', FMainWhen)]));
+end;
+
+function TPipeline.NewSinceMainLine(FileID: Cardinal): Boolean;
+// A file the main-line label does not hold belongs on the branch only when it was added after
+// the label was created - new work in the label's view, not yet labelled - and no other version
+// label holds it, which would make it another release's file. Files that already existed when
+// the label was made, and were left out of it, stay off the branch.
+var
+  T: TDateTime;
+begin
+  Result := FFirstAt.TryGetValue(FileID, T) and (CompareDateTime(T, FMainWhen) > 0) and
+    not FOtherAt.ContainsKey(FileID);
 end;
 
 function TPipeline.OnMainLine(const R: TTCRevision): Boolean;
 // Whether a revision belongs on the branch. For a file the main-line label holds: the label's
-// revision and those before it on its line, and a later revision that continues that line -
-// unless another version label holds it or a revision after it, which means it was checked in
-// under that label's view: a fix to another release. A file the label does not hold keeps
-// every revision, as without --main-line.
+// revision and those before it on its line, and a later revision that continues that line and
+// was checked in after the label was created - unless another version label holds it or a
+// revision after it, which means it was checked in under that label's view: a fix to another
+// release. A later revision that already existed when the label was made was left out of it
+// on purpose. A file the label does not hold is on the branch only if NewSinceMainLine.
 var
   L, Others, O: string;
 begin
   if not FMainLineOn then Exit(True);
-  if not FMainAt.TryGetValue(R.FileID, L) then Exit(True);
+  if not FMainAt.TryGetValue(R.FileID, L) then Exit(NewSinceMainLine(R.FileID));
   if RevOnLine(R.Revision, L) then Exit(True);
   if not RevOnLine(L, R.Revision) then Exit(False);     // on another line altogether
+  if CompareDateTime(R.When, FMainWhen) <= 0 then Exit(False);   // the label left it out
   if FOtherAt.TryGetValue(R.FileID, Others) then
     for O in Others.Split([';']) do
       if RevOnLine(R.Revision, O) then Exit(False);      // claimed by another view
@@ -2029,25 +2061,48 @@ begin
 end;
 
 procedure TPipeline.FollowMainLine;
-// Update mode, with --main-line: each file the label holds is put back on the label's line
-// where the branch holds something else. A branch built before --main-line took every revision
-// in check-in order, so a fix made for an older release after the newer work replaced that
-// work on the branch. Like a move, this is one commit, made before the new check-ins.
+// Update mode, with --main-line: the branch is made to hold what the label's view holds. Each
+// file the label holds is put back on the label's line where the branch holds something else -
+// a branch built before --main-line took every revision in check-in order, so a fix made for an
+// older release after the newer work replaced that work on the branch. And each file the label
+// does not hold is removed unless it was added since the label was created (NewSinceMainLine):
+// files that already existed and were left out of the label are not part of this version. Like
+// a move, this is one commit, made before the new check-ins; the history keeps what it removes.
+const
+  MaxListed = 500;
 var
   Want: TDictionary<Cardinal, TTCRevision>;
   Index: TObjectDictionary<string, TList<Integer>>;
   Marks: TDictionary<string, Integer>;
   Changes: TList<TChange>;
-  Shas, Listed: TStringList;
+  Shas, Listed, Dropped: TStringList;
   R, W: TTCRevision;
   Lst: TList<Integer>;
   E: TTreeEntry;
+  Pair: TPair<string, TTreeEntry>;
   Chg: TChange;
   N, Mark, I: Integer;
   P, Msg, Out1: string;
   GitProc: TProcessInformation;
   GitIn: THandle;
   FS: TStream;
+
+  function Upto(L: TStringList; const Indent: string): string;
+  var
+    J: Integer;
+  begin
+    Result := '';
+    for J := 0 to L.Count - 1 do
+    begin
+      if J = MaxListed then
+      begin
+        Result := Result + Format('%s... and %d more', [Indent, L.Count - MaxListed]) + #10;
+        Break;
+      end;
+      Result := Result + Indent + L[J] + #10;
+    end;
+  end;
+
 begin
   if FOpt.MainLine = '' then Exit;
   EnsureMainLine;
@@ -2057,6 +2112,7 @@ begin
   Changes := TList<TChange>.Create;
   Shas := TStringList.Create;
   Listed := TStringList.Create;
+  Dropped := TStringList.Create;
   try
     // the newest revision on the line that git already has, per file the label holds
     for R in FSession.Revisions do
@@ -2078,12 +2134,22 @@ begin
         Chg.Mark := N;          // the blob's index, until the stream gives it a mark
         Changes.Add(Chg);
         Shas.Add(FBlobs[N].Sha);
-        Listed.Add(Format('  %s: %s', [P, W.Revision]));
+        Listed.Add(Format('%s: %s', [P, W.Revision]));
       end;
     end;
-    if Changes.Count = 0 then
+
+    // the files the label's view does not have; FileID 0 is a file tc2git writes itself
+    for Pair in FTree do
+      if (Pair.Value.FileID <> 0) and not FMainAt.ContainsKey(Pair.Value.FileID) and
+         not NewSinceMainLine(Pair.Value.FileID) then
+        Dropped.Add(Pair.Key);
+    Dropped.Sort;
+    Listed.Sort;
+
+    if (Changes.Count = 0) and (Dropped.Count = 0) then
     begin
-      Log(Format('Every file label %s holds is on its line at the tip.', [FOpt.MainLine]));
+      Log(Format('The branch holds what label %s''s view holds: each file it holds is on its ' +
+        'line, and no file it leaves out is on the branch.', [FOpt.MainLine]));
       Exit;
     end;
 
@@ -2105,19 +2171,29 @@ begin
         Chg.Mark := N;
         Changes[I] := Chg;
       end;
-      if Changes.Count > 0 then
+      if (Changes.Count > 0) or (Dropped.Count > 0) then
       begin
-        Listed.Sort;
-        Msg := Format('Follow label %s''s line in Team Coherence' + #10#10 +
-          'The view based on label %s has these files at the revisions below. The branch held ' +
-          'a later revision checked in under another release''s view, which belongs to that ' +
-          'release''s branch, not this one.' + #10#10 + '%s' + #10,
-          [FOpt.MainLine, FOpt.MainLine, string.Join(#10, Listed.ToStringArray)]);
+        Msg := Format('Follow label %s''s view in Team Coherence' + #10#10, [FOpt.MainLine]);
+        if Dropped.Count > 0 then
+          Msg := Msg + Format('%d file(s) removed that label %s does not hold. They existed ' +
+            'when the label was created (%s) and were left out of it, so they are not part of ' +
+            'this version; the history and the older release branches keep them. A file added ' +
+            'after that date is kept, as new work for this version.' + #10#10,
+            [Dropped.Count, FOpt.MainLine, FormatDateTime('yyyy-mm-dd', FMainWhen)]);
+        if Changes.Count > 0 then
+          Msg := Msg + Format('%d file(s) set to the revision on label %s''s line. The branch ' +
+            'held a revision checked in under another release''s view, or one that existed ' +
+            'when the label was made and was left out of it:' + #10#10 + '%s' + #10,
+            [Changes.Count, FOpt.MainLine, Upto(Listed, '  ')]);
+        if Dropped.Count > 0 then
+          Msg := Msg + 'Removed:' + #10#10 + Upto(Dropped, '  ');
         PutLine(FS, 'commit refs/heads/' + FOpt.Branch);
         PutLine(FS, Format('committer %s %s', [MapAuthor('tc'), GitStamp(NowUtc)]));
         PutLine(FS, 'data ' + IntToStr(Length(TEncoding.UTF8.GetBytes(Msg))));
         PutLine(FS, Msg);
         PutLine(FS, 'from refs/heads/' + FOpt.Branch + '^0');
+        for P in Dropped do
+          PutLine(FS, 'D ' + P);
         for Chg in Changes do
           PutLine(FS, Format('M 100644 :%d %s', [Chg.Mark, Chg.Path]));
       end;
@@ -2130,18 +2206,25 @@ begin
       Log(Out1);
       raise Exception.Create('git fast-import failed while following the main line.');
     end;
-    if Changes.Count = 0 then Exit;
+    if (Changes.Count = 0) and (Dropped.Count = 0) then Exit;
     for Chg in Changes do
     begin
       E := FTree[Chg.Path];
       E.Sha := Chg.Sha;
       FTree.AddOrSetValue(Chg.Path, E);
     end;
-    Log(Format('%d path(s) put back on label %s''s line; they held revisions checked in for ' +
-      'other releases:', [Changes.Count, FOpt.MainLine]));
-    for P in Listed do Log(P);
+    for P in Dropped do FTree.Remove(P);
+    if Changes.Count > 0 then
+    begin
+      Log(Format('%d path(s) put back on label %s''s line:', [Changes.Count, FOpt.MainLine]));
+      for P in Listed do Log('  ' + P);
+    end;
+    if Dropped.Count > 0 then
+      Log(Format('%d file(s) removed that label %s does not hold and that existed when it was ' +
+        'created; the commit lists them.', [Dropped.Count, FOpt.MainLine]));
     SaveUpdateCheckpoint;
   finally
+    Dropped.Free;
     Listed.Free;
     Shas.Free;
     Changes.Free;
@@ -3845,7 +3928,8 @@ var
   Key: string;
   I, P, Idx, BatchEnd, Total, BatchNo, FetchWindow, OffLine: Integer;
 begin
-  if not TestConnection then
+  // offline, nothing is fetched: what is not already in the blob store is left for a real run
+  if not FOpt.Offline and not TestConnection then
     raise Exception.Create(
       'The Team Coherence server is not reachable.'#13#10#13#10 +
       'Check the VPN, then run again - the update continues from where it stopped.');
